@@ -21,6 +21,7 @@ load_dotenv()
 
 MAX_MACRO_RETRIES = 2
 MAX_TOOL_ROUND_TRIPS = 3
+MAX_EDIT_RETRIES = 2
 
 FOURSQUARE_API_KEY = os.getenv("FOURSQUARE_API_KEY")
 FOURSQUARE_SEARCH_URL = "https://places-api.foursquare.com/places/search"
@@ -111,7 +112,11 @@ MACRO_PROMPT = ChatPromptTemplate.from_messages(
             "and duration. Never ask the user to clarify.\n"
             "- Keep the number of stops reasonable for the trip length so the "
             "pace matches what the traveler asked for.\n"
-            "- Give a short rationale for each stop.",
+            "- Give a short rationale for each stop.\n"
+            "- Current plan (if editing): {current_plan}. If a current plan is "
+            "given, make the minimal change needed to satisfy the traveler's "
+            "request — keep the same stops unless the request requires "
+            "adding, removing, or reordering them.",
         ),
         ("system", "Trip request: {trip_request}"),
         ("system", "{feedback}"),
@@ -127,6 +132,7 @@ def generate_macro_plan(state: ItineraryState) -> dict:
         {
             "trip_request": state["trip_request"].model_dump_json(),
             "feedback": feedback,
+            "current_plan": "",
         }
     )
     return {"macro_plan": macro_plan}
@@ -302,7 +308,11 @@ stop_graph.add_edge("finalize", END)
 stop_planning_graph = stop_graph.compile()
 
 
-def _plan_stop(trip_request: TripRequest, stop: MacroStop) -> StopItinerary:
+def _plan_stop(
+    trip_request: TripRequest,
+    stop: MacroStop,
+    extra_instruction: Optional[str] = None,
+) -> StopItinerary:
     system_message = SystemMessage(
         content=(
             "You are a travel-planning agent building a day-by-day itinerary "
@@ -320,6 +330,7 @@ def _plan_stop(trip_request: TripRequest, stop: MacroStop) -> StopItinerary:
             "from a search_places result. If you rely on your own knowledge "
             "instead, say so plainly rather than presenting a guess as "
             "confirmed."
+            + (f"\n\n{extra_instruction}" if extra_instruction else "")
         )
     )
     human_message = HumanMessage(
@@ -339,14 +350,19 @@ def _plan_stop(trip_request: TripRequest, stop: MacroStop) -> StopItinerary:
 # --- Daily itinerary generation (drives the per-stop sub-flow) ------------
 
 
-def generate_daily_itinerary(state: ItineraryState) -> dict:
-    trip_request = state["trip_request"]
-    macro_plan = state["macro_plan"]
+def _total_cost(days: List[DayPlan]) -> Optional[float]:
+    costs = [
+        activity.estimated_cost_usd
+        for day in days
+        for activity in day.activities
+        if activity.estimated_cost_usd is not None
+    ]
+    return sum(costs) if costs else None
 
+
+def _build_daily_itinerary(trip_request: TripRequest, macro_plan: MacroPlan) -> DailyItinerary:
     days: List[DayPlan] = []
     day_number = 1
-    total_cost = 0.0
-    have_cost = False
 
     for stop in macro_plan.stops:
         stop_itinerary = _plan_stop(trip_request, stop)
@@ -358,16 +374,13 @@ def generate_daily_itinerary(state: ItineraryState) -> dict:
                     activities=day_content.activities,
                 )
             )
-            for activity in day_content.activities:
-                if activity.estimated_cost_usd is not None:
-                    total_cost += activity.estimated_cost_usd
-                    have_cost = True
             day_number += 1
 
-    daily_itinerary = DailyItinerary(
-        days=days,
-        estimated_total_cost_usd=total_cost if have_cost else None,
-    )
+    return DailyItinerary(days=days, estimated_total_cost_usd=_total_cost(days))
+
+
+def generate_daily_itinerary(state: ItineraryState) -> dict:
+    daily_itinerary = _build_daily_itinerary(state["trip_request"], state["macro_plan"])
     return {"daily_itinerary": daily_itinerary}
 
 
@@ -400,6 +413,327 @@ def plan_trip(trip_request: TripRequest) -> ItineraryState:
             "daily_itinerary": None,
         }
     )
+
+
+# --- Phase 4: conversational editing of an existing plan -------------------
+
+
+class EditState(TypedDict):
+    trip_request: TripRequest
+    macro_plan: MacroPlan
+    daily_itinerary: DailyItinerary
+    edit_request: str
+
+    edit_scope: Optional[Literal["macro", "stop", "unsupported"]]
+    target_day_numbers: Optional[List[int]]
+    classification_note: Optional[str]
+
+    edit_retry_count: int
+    validation_feedback: Optional[str]
+
+    candidate_macro_plan: Optional[MacroPlan]
+    candidate_daily_itinerary: Optional[DailyItinerary]
+
+    response_message: Optional[str]
+
+
+class EditClassification(BaseModel):
+    scope: Literal["macro", "stop", "unsupported"]
+    target_day_numbers: List[int] = Field(
+        default_factory=list,
+        description="Day numbers (from the CURRENT daily itinerary) this edit "
+        "targets. Required and non-empty when scope='stop'. Empty when "
+        "scope='macro' or 'unsupported'.",
+    )
+    note: str = Field(
+        description="One sentence. If scope='unsupported', explain why this "
+        "can't be applied as a plan edit (e.g. it's a factual question, not a "
+        "change request). Otherwise, briefly restate what will change."
+    )
+
+
+edit_classifier = model.with_structured_output(EditClassification)
+
+EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You classify a traveler's edit request against their existing "
+            "trip plan.\n"
+            "Current macro plan (stops in order): {macro_summary}\n"
+            "Current daily itinerary (day_number: city): {daily_summary}\n\n"
+            "Decide the scope:\n"
+            "- 'macro': the request changes the allocation of days across "
+            "stops, adds/removes/reorders stops, or otherwise affects more "
+            "than one stop (e.g. 'give Tokyo one more day and take it from "
+            "Osaka', 'make the whole trip cheaper').\n"
+            "- 'stop': the request only changes activities within one stop's "
+            "existing days (e.g. 'less museums in Kyoto', 'more food on day "
+            "3'). Set target_day_numbers to the exact day_number(s) that stop "
+            "occupies.\n"
+            "- 'unsupported': the request isn't a plan-edit at all (a factual "
+            "question, something unrelated to this trip, or a change this "
+            "planner can't make).",
+        ),
+        ("human", "{edit_request}"),
+    ]
+)
+
+edit_classify_chain = EDIT_CLASSIFY_PROMPT | edit_classifier
+
+
+def _validate_stop_target(
+    macro_plan: MacroPlan, daily_itinerary: DailyItinerary, target_day_numbers: List[int]
+) -> Optional[str]:
+    """Returns an error string if target_day_numbers is unusable for a
+    whole-stop edit, or None if it resolves cleanly to a single stop."""
+    if not target_day_numbers:
+        return "no target day(s) were identified for this stop-level edit."
+
+    valid_days = {day.day_number for day in daily_itinerary.days}
+    invalid_days = [d for d in target_day_numbers if d not in valid_days]
+    if invalid_days:
+        return f"day(s) {invalid_days} don't exist in the current itinerary."
+
+    try:
+        _find_stop_for_days(macro_plan, target_day_numbers)
+    except ValueError:
+        return (
+            f"day(s) {target_day_numbers} span more than one stop; this kind "
+            "of cross-stop change needs a macro-level edit instead."
+        )
+    return None
+
+
+def classify_edit(state: EditState) -> dict:
+    macro_plan = state["macro_plan"]
+    daily_itinerary = state["daily_itinerary"]
+
+    macro_summary = "; ".join(f"{stop.city} ({stop.days}d)" for stop in macro_plan.stops)
+    daily_summary = "; ".join(
+        f"day {day.day_number}: {day.city}" for day in daily_itinerary.days
+    )
+
+    classification = edit_classify_chain.invoke(
+        {
+            "macro_summary": macro_summary,
+            "daily_summary": daily_summary,
+            "edit_request": state["edit_request"],
+        }
+    )
+
+    scope = classification.scope
+    target_day_numbers = classification.target_day_numbers or None
+    note = classification.note
+
+    if scope == "stop":
+        error = _validate_stop_target(macro_plan, daily_itinerary, target_day_numbers or [])
+        if error:
+            scope = "unsupported"
+            note = f"Could not resolve the target day(s) for this edit: {error}"
+
+    return {
+        "edit_scope": scope,
+        "target_day_numbers": target_day_numbers,
+        "classification_note": note,
+    }
+
+
+def _find_stop_for_days(macro_plan: MacroPlan, target_day_numbers: List[int]) -> MacroStop:
+    day_number = 1
+    for stop in macro_plan.stops:
+        stop_days = set(range(day_number, day_number + stop.days))
+        if set(target_day_numbers) <= stop_days:
+            return stop
+        day_number += stop.days
+    raise ValueError(
+        f"target_day_numbers {target_day_numbers} do not fall entirely within "
+        "a single stop; this should have been classified as scope='macro'."
+    )
+
+
+def _splice_stop_days(
+    baseline_days: List[DayPlan],
+    target_day_numbers: List[int],
+    stop: MacroStop,
+    new_days: List[StopDayContent],
+) -> List[DayPlan]:
+    replacement = {
+        day_number: DayPlan(day_number=day_number, city=stop.city, activities=content.activities)
+        for day_number, content in zip(sorted(target_day_numbers), new_days)
+    }
+    return [replacement.get(day.day_number, day) for day in baseline_days]
+
+
+def apply_macro_edit(state: EditState) -> dict:
+    trip_request = state["trip_request"]
+    macro_plan = state["macro_plan"]
+    feedback = state.get("validation_feedback")
+
+    current_plan = "; ".join(f"{stop.city} ({stop.days}d)" for stop in macro_plan.stops)
+
+    instruction = f"Traveler wants this change: {state['edit_request']}."
+    if feedback:
+        instruction += f" {feedback}"
+
+    candidate_macro_plan = macro_chain.invoke(
+        {
+            "trip_request": trip_request.model_dump_json(),
+            "feedback": instruction,
+            "current_plan": current_plan,
+        }
+    )
+    candidate_daily_itinerary = _build_daily_itinerary(trip_request, candidate_macro_plan)
+    return {
+        "candidate_macro_plan": candidate_macro_plan,
+        "candidate_daily_itinerary": candidate_daily_itinerary,
+    }
+
+
+def _stop_day_numbers(macro_plan: MacroPlan, stop: MacroStop) -> List[int]:
+    """The full, contiguous range of day_numbers a stop owns in the macro plan."""
+    day_number = 1
+    for candidate in macro_plan.stops:
+        if candidate is stop:
+            return list(range(day_number, day_number + stop.days))
+        day_number += candidate.days
+    raise ValueError(f"stop '{stop.city}' not found in macro_plan.")
+
+
+def apply_stop_edit(state: EditState) -> dict:
+    trip_request = state["trip_request"]
+    macro_plan = state["macro_plan"]
+    baseline_days = state["daily_itinerary"].days
+    target_day_numbers = state["target_day_numbers"]
+    feedback = state.get("validation_feedback")
+
+    # classify_edit has already validated target_day_numbers resolves to a
+    # single stop; this call is expected to succeed.
+    stop = _find_stop_for_days(macro_plan, target_day_numbers)
+    all_stop_day_numbers = _stop_day_numbers(macro_plan, stop)
+
+    previous_activities = [
+        activity.name
+        for day in baseline_days
+        if day.day_number in all_stop_day_numbers
+        for activity in day.activities
+    ]
+    instruction = (
+        f"Traveler edit request: '{state['edit_request']}'. "
+        f"Previously planned activities for this stop: "
+        f"{', '.join(previous_activities) or 'none'}."
+    )
+    if feedback:
+        instruction += f" {feedback}"
+
+    stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=instruction)
+
+    new_days = _splice_stop_days(baseline_days, all_stop_day_numbers, stop, stop_itinerary.days)
+    candidate_daily_itinerary = DailyItinerary(
+        days=new_days, estimated_total_cost_usd=_total_cost(new_days)
+    )
+    return {
+        "candidate_macro_plan": macro_plan,
+        "candidate_daily_itinerary": candidate_daily_itinerary,
+    }
+
+
+def validate_edit(state: EditState) -> dict:
+    macro_plan = state["candidate_macro_plan"]
+    daily_itinerary = state["candidate_daily_itinerary"]
+    trip_request = state["trip_request"]
+
+    problems = []
+
+    total_days = sum(stop.days for stop in macro_plan.stops)
+    if total_days != trip_request.duration_days:
+        problems.append(f"stop days sum to {total_days}, expected {trip_request.duration_days}")
+
+    day_numbers = [day.day_number for day in daily_itinerary.days]
+    expected_numbers = list(range(1, len(day_numbers) + 1))
+    if sorted(day_numbers) != expected_numbers:
+        problems.append(f"day numbers {sorted(day_numbers)} are not contiguous from 1")
+
+    city_by_day = {}
+    day_number = 1
+    for stop in macro_plan.stops:
+        for _ in range(stop.days):
+            city_by_day[day_number] = stop.city
+            day_number += 1
+    for day in daily_itinerary.days:
+        expected_city = city_by_day.get(day.day_number)
+        if expected_city is not None and day.city != expected_city:
+            problems.append(
+                f"day {day.day_number} is labeled '{day.city}' but the macro "
+                f"plan expects '{expected_city}'"
+            )
+
+    if not problems:
+        return {"validation_feedback": None}
+
+    return {
+        "validation_feedback": "Fix these issues: " + "; ".join(problems),
+        "edit_retry_count": state["edit_retry_count"] + 1,
+    }
+
+
+def respond_unsupported(state: EditState) -> dict:
+    return {
+        "response_message": f"I can't apply that as a plan edit: {state['classification_note']}"
+    }
+
+
+def route_after_classify(state: EditState) -> str:
+    return state["edit_scope"]
+
+
+def route_after_edit_validation(state: EditState) -> str:
+    if state["validation_feedback"] is None:
+        return "done"
+    if state["edit_retry_count"] >= MAX_EDIT_RETRIES:
+        return "done"
+    return "retry_macro" if state["edit_scope"] == "macro" else "retry_stop"
+
+
+edit_graph_builder = StateGraph(EditState)
+edit_graph_builder.add_node("classify_edit", classify_edit)
+edit_graph_builder.add_node("apply_macro_edit", apply_macro_edit)
+edit_graph_builder.add_node("apply_stop_edit", apply_stop_edit)
+edit_graph_builder.add_node("validate_edit", validate_edit)
+edit_graph_builder.add_node("respond_unsupported", respond_unsupported)
+
+edit_graph_builder.set_entry_point("classify_edit")
+edit_graph_builder.add_conditional_edges(
+    "classify_edit",
+    route_after_classify,
+    {
+        "macro": "apply_macro_edit",
+        "stop": "apply_stop_edit",
+        "unsupported": "respond_unsupported",
+    },
+)
+edit_graph_builder.add_edge("apply_macro_edit", "validate_edit")
+edit_graph_builder.add_edge("apply_stop_edit", "validate_edit")
+edit_graph_builder.add_conditional_edges(
+    "validate_edit",
+    route_after_edit_validation,
+    {
+        "retry_macro": "apply_macro_edit",
+        "retry_stop": "apply_stop_edit",
+        "done": END,
+    },
+)
+edit_graph_builder.add_edge("respond_unsupported", END)
+
+edit_graph = edit_graph_builder.compile()
+
+
+def _apply_committed_edit(
+    macro_plan: MacroPlan, daily_itinerary: DailyItinerary, result: dict
+):
+    if result["edit_scope"] == "unsupported":
+        return macro_plan, daily_itinerary, result["response_message"]
+    return result["candidate_macro_plan"], result["candidate_daily_itinerary"], None
 
 
 def _print_result(result: dict) -> None:
@@ -438,4 +772,37 @@ if __name__ == "__main__":
     trip = run_intake()
     print("\nGenerating itinerary...")
     result = plan_trip(trip)
+    macro_plan = result["macro_plan"]
+    daily_itinerary = result["daily_itinerary"]
     _print_result(result)
+
+    print("\nYou can now ask for changes (or type 'done' to finish).")
+    while True:
+        message = input("> ").strip()
+        if not message or message.lower() == "done":
+            break
+
+        edit_result = edit_graph.invoke(
+            {
+                "trip_request": trip,
+                "macro_plan": macro_plan,
+                "daily_itinerary": daily_itinerary,
+                "edit_request": message,
+                "edit_scope": None,
+                "target_day_numbers": None,
+                "classification_note": None,
+                "edit_retry_count": 0,
+                "validation_feedback": None,
+                "candidate_macro_plan": None,
+                "candidate_daily_itinerary": None,
+                "response_message": None,
+            }
+        )
+        macro_plan, daily_itinerary, message_out = _apply_committed_edit(
+            macro_plan, daily_itinerary, edit_result
+        )
+        if message_out:
+            print(message_out)
+        else:
+            print("\nUpdated.")
+            _print_result({"macro_plan": macro_plan, "daily_itinerary": daily_itinerary})
