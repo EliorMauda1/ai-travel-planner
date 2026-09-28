@@ -214,7 +214,7 @@ def search_places(city: str, category: str, query: str = "") -> str:
     like 'restaurant', 'museum', 'temple', 'park', or 'cafe'. `query` is an
     optional extra keyword to narrow results (e.g. 'ramen', 'anime')."""
     places = _foursquare_search(city, category, query)
-
+    # This means None
     if places is None:
         return (
             "SEARCH_UNAVAILABLE: the places search could not be reached right "
@@ -222,6 +222,7 @@ def search_places(city: str, category: str, query: str = "") -> str:
             "you MUST mark them as unverified (source='llm_estimate'), never "
             "as confirmed/verified."
         )
+    # This means []
     if not places:
         return (
             f"SEARCH_NO_RESULTS: no matching places found for "
