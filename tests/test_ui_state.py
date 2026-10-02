@@ -159,10 +159,12 @@ def test_build_initial_edit_state_shape():
         "daily_itinerary",
         "edit_request",
         "edit_scope",
-        "target_day_numbers",
+        "target_stops",
         "classification_note",
+        "excluded_categories",
         "edit_retry_count",
         "validation_feedback",
+        "hard_constraint_violation",
         "candidate_macro_plan",
         "candidate_daily_itinerary",
         "response_message",
@@ -172,10 +174,12 @@ def test_build_initial_edit_state_shape():
     assert state["daily_itinerary"] is daily_itinerary
     assert state["edit_request"] == "less museums"
     assert state["edit_scope"] is None
-    assert state["target_day_numbers"] is None
+    assert state["target_stops"] is None
     assert state["classification_note"] is None
+    assert state["excluded_categories"] is None
     assert state["edit_retry_count"] == 0
     assert state["validation_feedback"] is None
+    assert state["hard_constraint_violation"] is None
     assert state["candidate_macro_plan"] is None
     assert state["candidate_daily_itinerary"] is None
     assert state["response_message"] is None

@@ -1,4 +1,5 @@
-"""Phase 4: tests for the conversational plan-editing graph.
+"""Phase 4 (+ cross-stop/content-edit fix): tests for the conversational
+plan-editing graph.
 
 External calls (edit_classify_chain, macro_chain, _plan_stop) are stubbed via
 monkeypatch so these tests run offline and deterministically, without hitting
@@ -19,7 +20,7 @@ from ai_travel_planner.itinerary import (
     StopDayContent,
     StopItinerary,
     _apply_committed_edit,
-    _find_stop_for_days,
+    _resolve_stops,
     _splice_stop_days,
     _stop_day_numbers,
     _total_cost,
@@ -32,9 +33,9 @@ from ai_travel_planner.itinerary import (
 )
 
 
-def _activity(name: str, cost: float = 10.0) -> Activity:
+def _activity(name: str, cost: float = 10.0, category: str = "sightseeing") -> Activity:
     return Activity(
-        name=name, description="d", category="sightseeing", estimated_cost_usd=cost, source="llm_estimate"
+        name=name, description="d", category=category, estimated_cost_usd=cost, source="llm_estimate"
     )
 
 
@@ -85,10 +86,12 @@ def make_edit_state(**overrides) -> dict:
         "daily_itinerary": daily_itinerary,
         "edit_request": "some edit",
         "edit_scope": None,
-        "target_day_numbers": None,
+        "target_stops": None,
         "classification_note": None,
+        "excluded_categories": None,
         "edit_retry_count": 0,
         "validation_feedback": None,
+        "hard_constraint_violation": None,
         "candidate_macro_plan": None,
         "candidate_daily_itinerary": None,
         "response_message": None,
@@ -132,6 +135,41 @@ def test_apply_macro_edit_supported(monkeypatch):
     assert [d.day_number for d in days] == list(range(1, 8))
 
 
+def test_apply_macro_edit_passes_instruction_to_daily_regeneration(monkeypatch):
+    state = make_edit_state(edit_request="give Tokyo one more day and take it from Osaka")
+
+    reallocated = MacroPlan(
+        stops=[
+            MacroStop(city="Tokyo", country="Japan", days=4, rationale="r"),
+            MacroStop(city="Kyoto", country="Japan", days=2, rationale="r"),
+            MacroStop(city="Osaka", country="Japan", days=1, rationale="r"),
+        ]
+    )
+
+    class FakeMacroChain:
+        def invoke(self, args):
+            return reallocated
+
+    monkeypatch.setattr(itinerary, "macro_chain", FakeMacroChain())
+
+    captured_instructions = []
+
+    def fake_plan_stop(trip_request, stop, extra_instruction=None):
+        captured_instructions.append(extra_instruction)
+        return StopItinerary(
+            days=[StopDayContent(activities=[_activity(f"{stop.city} act")]) for _ in range(stop.days)]
+        )
+
+    monkeypatch.setattr(itinerary, "_plan_stop", fake_plan_stop)
+
+    apply_macro_edit(state)
+
+    assert len(captured_instructions) == 3  # one call per regenerated stop
+    assert all(
+        instr is not None and "give Tokyo one more day" in instr for instr in captured_instructions
+    )
+
+
 # --- 2. supported stop edit ---------------------------------------------------
 
 
@@ -143,7 +181,7 @@ def test_apply_stop_edit_supported(monkeypatch):
         daily_itinerary=daily_itinerary,
         edit_request="less museums in Kyoto",
         edit_scope="stop",
-        target_day_numbers=[4, 5],
+        target_stops=["Kyoto"],
     )
 
     new_stop_itinerary = StopItinerary(
@@ -175,6 +213,125 @@ def test_apply_stop_edit_supported(monkeypatch):
     assert result["candidate_macro_plan"] == macro_plan
 
 
+def test_apply_stop_edit_regenerates_whole_stop_for_resolved_target(monkeypatch):
+    """apply_stop_edit does not perform any day->stop resolution itself - it
+    receives an already-resolved target_stops=['Kyoto'] (the shape a
+    classifier would produce for a day-specific request like 'more food on
+    day 4') and regenerates that whole stop, not just one day within it."""
+    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        daily_itinerary=daily_itinerary,
+        edit_request="more food on day 4",
+        edit_scope="stop",
+        target_stops=["Kyoto"],
+    )
+
+    new_stop_itinerary = StopItinerary(
+        days=[
+            StopDayContent(activities=[_activity("Food day 4", cost=10.0)]),
+            StopDayContent(activities=[_activity("Food day 5", cost=10.0)]),
+        ]
+    )
+    monkeypatch.setattr(itinerary, "_plan_stop", lambda tr, stop, extra_instruction=None: new_stop_itinerary)
+
+    result = apply_stop_edit(state)
+
+    new_days = result["candidate_daily_itinerary"].days
+    baseline_days = daily_itinerary.days
+
+    # Both Kyoto days (4 and 5) were regenerated, not just day 4.
+    assert new_days[3].activities[0].name == "Food day 4"
+    assert new_days[4].activities[0].name == "Food day 5"
+    # Everything outside Kyoto is untouched (identity, not just equality).
+    assert new_days[0] is baseline_days[0]
+    assert new_days[1] is baseline_days[1]
+    assert new_days[2] is baseline_days[2]
+    assert new_days[5] is baseline_days[5]
+    assert new_days[6] is baseline_days[6]
+
+
+def test_apply_stop_edit_multiple_named_stops(monkeypatch):
+    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        daily_itinerary=daily_itinerary,
+        edit_request="exclude food in Kyoto and Osaka, leave Tokyo alone",
+        edit_scope="stop",
+        target_stops=["Kyoto", "Osaka"],
+    )
+
+    def fake_plan_stop(trip_request, stop, extra_instruction=None):
+        return StopItinerary(
+            days=[
+                StopDayContent(activities=[_activity(f"{stop.city} new act")])
+                for _ in range(stop.days)
+            ]
+        )
+
+    monkeypatch.setattr(itinerary, "_plan_stop", fake_plan_stop)
+
+    result = apply_stop_edit(state)
+
+    new_days = result["candidate_daily_itinerary"].days
+    baseline_days = daily_itinerary.days
+
+    # Tokyo (days 1-3), not targeted, is untouched - identical baseline objects.
+    assert new_days[0] is baseline_days[0]
+    assert new_days[1] is baseline_days[1]
+    assert new_days[2] is baseline_days[2]
+
+    # Kyoto (4-5) and Osaka (6-7) were both regenerated.
+    assert new_days[3].activities[0].name == "Kyoto new act"
+    assert new_days[4].activities[0].name == "Kyoto new act"
+    assert new_days[5].activities[0].name == "Osaka new act"
+    assert new_days[6].activities[0].name == "Osaka new act"
+
+    assert result["candidate_macro_plan"] == macro_plan
+
+
+def test_apply_stop_edit_all_named_stops(monkeypatch):
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        daily_itinerary=daily_itinerary,
+        edit_request="exclude food everywhere, kosher only",
+        edit_scope="stop",
+        target_stops=["Tokyo", "Kyoto", "Osaka"],
+    )
+
+    def fake_plan_stop(trip_request, stop, extra_instruction=None):
+        return StopItinerary(
+            days=[
+                StopDayContent(activities=[_activity(f"{stop.city} sightseeing")])
+                for _ in range(stop.days)
+            ]
+        )
+
+    monkeypatch.setattr(itinerary, "_plan_stop", fake_plan_stop)
+
+    result = apply_stop_edit(state)
+
+    new_days = result["candidate_daily_itinerary"].days
+    baseline_days = daily_itinerary.days
+
+    # Every day was regenerated - none are the original baseline objects.
+    assert all(new is not old for new, old in zip(new_days, baseline_days))
+    assert [d.activities[0].name for d in new_days] == [
+        "Tokyo sightseeing",
+        "Tokyo sightseeing",
+        "Tokyo sightseeing",
+        "Kyoto sightseeing",
+        "Kyoto sightseeing",
+        "Osaka sightseeing",
+        "Osaka sightseeing",
+    ]
+    assert result["candidate_macro_plan"] is macro_plan
+
+
 # --- 3. unsupported request ---------------------------------------------------
 
 
@@ -182,7 +339,7 @@ def test_unsupported_request(monkeypatch):
     state = make_edit_state(edit_request="what's the deal with the JR pass?")
 
     classification = EditClassification(
-        scope="unsupported", target_day_numbers=[], note="This is a question, not a change request."
+        scope="unsupported", target_stops=[], note="This is a question, not a change request."
     )
 
     class FakeClassifyChain:
@@ -269,19 +426,22 @@ def test_validation_failure_triggers_retry_from_baseline(monkeypatch):
     assert "Fix these issues" in calls[1]["feedback"]
 
 
-# --- 6. target day resolution -------------------------------------------------
+# --- 6. target stop resolution -------------------------------------------------
 
 
-def test_find_stop_for_days():
-    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+def test_resolve_stops():
+    macro_plan = make_macro_plan()  # Tokyo, Kyoto, Osaka (in that order)
 
-    assert _find_stop_for_days(macro_plan, [4, 5]).city == "Kyoto"
-    assert _find_stop_for_days(macro_plan, [1, 2, 3]).city == "Tokyo"
-    assert _find_stop_for_days(macro_plan, [6, 7]).city == "Osaka"
-    assert _find_stop_for_days(macro_plan, [4]).city == "Kyoto"
-
-    with pytest.raises(ValueError):
-        _find_stop_for_days(macro_plan, [3, 4])  # spans Tokyo and Kyoto
+    assert [s.city for s in _resolve_stops(macro_plan, ["Kyoto"])] == ["Kyoto"]
+    # Order follows the trip's own order, not the input list's order.
+    assert [s.city for s in _resolve_stops(macro_plan, ["Osaka", "Tokyo"])] == ["Tokyo", "Osaka"]
+    # Case-insensitive.
+    assert [s.city for s in _resolve_stops(macro_plan, ["kyoto"])] == ["Kyoto"]
+    # Duplicate input names don't produce duplicate stops.
+    assert [s.city for s in _resolve_stops(macro_plan, ["Kyoto", "Kyoto"])] == ["Kyoto"]
+    # Unknown names are simply ignored (validation happens separately, in
+    # _validate_stop_targets / classify_edit).
+    assert _resolve_stops(macro_plan, ["Atlantis"]) == []
 
 
 # --- 7. cost recomputation -----------------------------------------------------
@@ -325,7 +485,7 @@ def test_edit_graph_end_to_end(monkeypatch):
     daily_itinerary = make_daily_itinerary(macro_plan)
 
     classification = EditClassification(
-        scope="stop", target_day_numbers=[4, 5], note="Reduce museums in Kyoto."
+        scope="stop", target_stops=["Kyoto"], note="Reduce museums in Kyoto."
     )
 
     class FakeClassifyChain:
@@ -356,6 +516,116 @@ def test_edit_graph_end_to_end(monkeypatch):
     kyoto_days = [d for d in result["candidate_daily_itinerary"].days if d.day_number in (4, 5)]
     assert kyoto_days[0].activities[0].name == "Nishiki Market"
     assert kyoto_days[1].activities[0].name == "Arashiyama Bamboo Grove"
+
+
+def test_edit_graph_multiple_named_stops(monkeypatch):
+    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+    daily_itinerary = make_daily_itinerary(macro_plan)
+
+    classification = EditClassification(
+        scope="stop",
+        target_stops=["Kyoto", "Osaka"],
+        note="Exclude food in Kyoto and Osaka.",
+    )
+
+    class FakeClassifyChain:
+        def invoke(self, args):
+            return classification
+
+    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
+
+    def fake_plan_stop(trip_request, stop, extra_instruction=None):
+        return StopItinerary(
+            days=[
+                StopDayContent(activities=[_activity(f"{stop.city} sightseeing")])
+                for _ in range(stop.days)
+            ]
+        )
+
+    monkeypatch.setattr(itinerary, "_plan_stop", fake_plan_stop)
+
+    result = itinerary.edit_graph.invoke(
+        make_edit_state(
+            macro_plan=macro_plan,
+            daily_itinerary=daily_itinerary,
+            edit_request="exclude food in Kyoto and Osaka, leave Tokyo alone",
+        )
+    )
+
+    assert result["edit_scope"] == "stop"
+    assert result["validation_feedback"] is None
+
+    new_days = result["candidate_daily_itinerary"].days
+    baseline_days = daily_itinerary.days
+
+    # Tokyo (days 1-3) untouched, through the real compiled graph.
+    assert new_days[0] is baseline_days[0]
+    assert new_days[1] is baseline_days[1]
+    assert new_days[2] is baseline_days[2]
+    # Kyoto and Osaka regenerated.
+    assert new_days[3].activities[0].name == "Kyoto sightseeing"
+    assert new_days[4].activities[0].name == "Kyoto sightseeing"
+    assert new_days[5].activities[0].name == "Osaka sightseeing"
+    assert new_days[6].activities[0].name == "Osaka sightseeing"
+
+
+def test_edit_graph_represents_day_specific_request_as_stop_target(monkeypatch):
+    """With a stubbed classifier returning target_stops=['Kyoto'] for a
+    day-specific request ('more food on day 4'), this proves: (a) a
+    day-specific request CAN be represented as a single stop target, (b) the
+    graph then regenerates the whole targeted stop, and (c) unrelated stops'
+    days stay identical by object identity. It does NOT prove that the real
+    LLM classifier correctly performs the day->stop semantic resolution
+    itself - that happens only when the live model is exercised, not here."""
+    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+    daily_itinerary = make_daily_itinerary(macro_plan)
+
+    classification = EditClassification(
+        scope="stop", target_stops=["Kyoto"], note="Add more food on day 4."
+    )
+
+    class FakeClassifyChain:
+        def invoke(self, args):
+            # Sanity: the classifier is at least given the day->city mapping
+            # it would need in order to perform that resolution itself.
+            assert "day 4: Kyoto" in args["daily_summary"]
+            return classification
+
+    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
+
+    new_stop_itinerary = StopItinerary(
+        days=[
+            StopDayContent(activities=[_activity("Food day 4", cost=10.0)]),
+            StopDayContent(activities=[_activity("Food day 5", cost=10.0)]),
+        ]
+    )
+    monkeypatch.setattr(itinerary, "_plan_stop", lambda tr, stop, extra_instruction=None: new_stop_itinerary)
+
+    result = itinerary.edit_graph.invoke(
+        make_edit_state(
+            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="more food on day 4"
+        )
+    )
+
+    assert result["edit_scope"] == "stop"
+    assert result["validation_feedback"] is None
+
+    new_days = result["candidate_daily_itinerary"].days
+    baseline_days = daily_itinerary.days
+
+    # Both Kyoto days (4 and 5) were replaced, not just the day the user
+    # literally mentioned.
+    assert new_days[3].day_number == 4
+    assert new_days[3].activities[0].name == "Food day 4"
+    assert new_days[4].day_number == 5
+    assert new_days[4].activities[0].name == "Food day 5"
+
+    # Days outside Kyoto remain the exact same baseline objects.
+    assert new_days[0] is baseline_days[0]
+    assert new_days[1] is baseline_days[1]
+    assert new_days[2] is baseline_days[2]
+    assert new_days[5] is baseline_days[5]
+    assert new_days[6] is baseline_days[6]
 
 
 # --- 9. committing the candidate back into the CLI's plan state ----------------
@@ -391,6 +661,28 @@ def test_apply_committed_edit_supported():
     assert message is None
 
 
+def test_apply_committed_edit_blocks_hard_constraint_violation():
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    candidate_macro = make_macro_plan()
+    candidate_daily = make_daily_itinerary(candidate_macro)
+    result = {
+        "edit_scope": "stop",
+        "candidate_macro_plan": candidate_macro,
+        "candidate_daily_itinerary": candidate_daily,
+        "hard_constraint_violation": "day 4 contains a 'food' activity (Ramen shop) "
+        "despite the exclusion request",
+    }
+
+    new_macro, new_daily, message = _apply_committed_edit(macro_plan, daily_itinerary, result)
+
+    # The violating candidate must NOT be committed - baseline preserved by identity.
+    assert new_macro is macro_plan
+    assert new_daily is daily_itinerary
+    assert message is not None
+    assert "Ramen shop" in message
+
+
 # --- classify_edit: valid resolution and invalid-target downgrade --------------
 
 
@@ -398,7 +690,7 @@ def test_classify_edit_resolves_stop_scope(monkeypatch):
     state = make_edit_state(edit_request="less museums in Kyoto")
 
     classification = EditClassification(
-        scope="stop", target_day_numbers=[4, 5], note="Reduce museums in Kyoto."
+        scope="stop", target_stops=["Kyoto"], note="Reduce museums in Kyoto."
     )
     captured = {}
 
@@ -412,16 +704,39 @@ def test_classify_edit_resolves_stop_scope(monkeypatch):
     result = classify_edit(state)
 
     assert result["edit_scope"] == "stop"
-    assert result["target_day_numbers"] == [4, 5]
+    assert result["target_stops"] == ["Kyoto"]
     assert result["classification_note"] == "Reduce museums in Kyoto."
     assert "day 4: Kyoto" in captured["daily_summary"]
     assert "day 5: Kyoto" in captured["daily_summary"]
 
 
+def test_classify_edit_extracts_excluded_categories(monkeypatch):
+    state = make_edit_state(edit_request="exclude food entirely, kosher only")
+
+    classification = EditClassification(
+        scope="stop",
+        target_stops=["Tokyo", "Kyoto", "Osaka"],
+        excluded_categories=["food"],
+        note="Exclude food across the whole trip.",
+    )
+
+    class FakeClassifyChain:
+        def invoke(self, args):
+            return classification
+
+    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
+
+    result = classify_edit(state)
+
+    assert result["edit_scope"] == "stop"
+    assert result["target_stops"] == ["Tokyo", "Kyoto", "Osaka"]
+    assert result["excluded_categories"] == ["food"]
+
+
 def test_classify_edit_downgrades_empty_target(monkeypatch):
     state = make_edit_state(edit_request="less museums in Kyoto")
 
-    classification = EditClassification(scope="stop", target_day_numbers=[], note="Reduce museums.")
+    classification = EditClassification(scope="stop", target_stops=[], note="Reduce museums.")
 
     class FakeClassifyChain:
         def invoke(self, args):
@@ -432,82 +747,27 @@ def test_classify_edit_downgrades_empty_target(monkeypatch):
     result = classify_edit(state)
 
     assert result["edit_scope"] == "unsupported"
-    assert "no target day(s)" in result["classification_note"]
+    assert "no target stop(s)" in result["classification_note"]
 
 
-def test_classify_edit_downgrades_out_of_range_target(monkeypatch):
-    state = make_edit_state(edit_request="more food on day 99")
+def test_classify_edit_downgrades_unknown_stop_name(monkeypatch):
+    state = make_edit_state(edit_request="less museums in Atlantis")
 
-    classification = EditClassification(scope="stop", target_day_numbers=[99], note="Add food.")
-
-    class FakeClassifyChain:
-        def invoke(self, args):
-            return classification
-
-    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
-
-    result = classify_edit(state)
-
-    assert result["edit_scope"] == "unsupported"
-    assert "99" in result["classification_note"]
-    assert "don't exist" in result["classification_note"]
-
-
-def test_classify_edit_downgrades_multi_stop_target(monkeypatch):
-    state = make_edit_state(edit_request="rework days 3 and 4")
-
-    classification = EditClassification(scope="stop", target_day_numbers=[3, 4], note="Rework.")
-
-    class FakeClassifyChain:
-        def invoke(self, args):
-            return classification
-
-    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
-
-    result = classify_edit(state)
-
-    assert result["edit_scope"] == "unsupported"
-    assert "span more than one stop" in result["classification_note"]
-
-
-# --- apply_stop_edit: whole-stop widening ---------------------------------------
-
-
-def test_apply_stop_edit_widens_to_full_stop(monkeypatch):
-    macro_plan = make_macro_plan()
-    daily_itinerary = make_daily_itinerary(macro_plan)
-    # Simulates "more food on day 4": classification targets only day 4, but
-    # Kyoto (the owning stop) spans days 4-5.
-    state = make_edit_state(
-        macro_plan=macro_plan,
-        daily_itinerary=daily_itinerary,
-        edit_request="more food on day 4",
-        edit_scope="stop",
-        target_day_numbers=[4],
+    classification = EditClassification(
+        scope="stop", target_stops=["Atlantis"], note="Reduce museums."
     )
 
-    new_stop_itinerary = StopItinerary(
-        days=[
-            StopDayContent(activities=[_activity("Food day 4", cost=10.0)]),
-            StopDayContent(activities=[_activity("Food day 5", cost=10.0)]),
-        ]
-    )
-    monkeypatch.setattr(itinerary, "_plan_stop", lambda tr, stop, extra_instruction=None: new_stop_itinerary)
+    class FakeClassifyChain:
+        def invoke(self, args):
+            return classification
 
-    result = apply_stop_edit(state)
+    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
 
-    new_days = result["candidate_daily_itinerary"].days
-    baseline_days = daily_itinerary.days
+    result = classify_edit(state)
 
-    # Both Kyoto days (4 and 5) were regenerated, not just day 4.
-    assert new_days[3].activities[0].name == "Food day 4"
-    assert new_days[4].activities[0].name == "Food day 5"
-    # Everything outside the owning stop is untouched (identity, not just equality).
-    assert new_days[0] is baseline_days[0]
-    assert new_days[1] is baseline_days[1]
-    assert new_days[2] is baseline_days[2]
-    assert new_days[5] is baseline_days[5]
-    assert new_days[6] is baseline_days[6]
+    assert result["edit_scope"] == "unsupported"
+    assert "Atlantis" in result["classification_note"]
+    assert "don't match any stop" in result["classification_note"]
 
 
 def test_stop_day_numbers():
@@ -563,7 +823,7 @@ def test_edit_graph_retries_on_validation_failure(monkeypatch):
     macro_plan = make_macro_plan()
     daily_itinerary = make_daily_itinerary(macro_plan)
 
-    classification = EditClassification(scope="macro", target_day_numbers=[], note="Rebalance days.")
+    classification = EditClassification(scope="macro", target_stops=[], note="Rebalance days.")
 
     class FakeClassifyChain:
         def invoke(self, args):
@@ -640,7 +900,7 @@ def test_edit_graph_invalid_target_is_noop(monkeypatch):
     macro_plan = make_macro_plan()
     daily_itinerary = make_daily_itinerary(macro_plan)
 
-    classification = EditClassification(scope="stop", target_day_numbers=[], note="Some stop edit.")
+    classification = EditClassification(scope="stop", target_stops=[], note="Some stop edit.")
 
     class FakeClassifyChain:
         def invoke(self, args):
@@ -660,13 +920,13 @@ def test_edit_graph_invalid_target_is_noop(monkeypatch):
 
     result = itinerary.edit_graph.invoke(
         make_edit_state(
-            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="more food on day 4"
+            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="more food everywhere"
         )
     )
 
     assert result["edit_scope"] == "unsupported"
     assert result["response_message"] is not None
-    assert "no target day(s)" in result["response_message"]
+    assert "no target stop(s)" in result["response_message"]
     assert result["candidate_macro_plan"] is None
     assert result["candidate_daily_itinerary"] is None
 
@@ -676,17 +936,109 @@ def test_edit_graph_invalid_target_is_noop(monkeypatch):
     assert message == result["response_message"]
 
 
-# --- edit_graph: partial target is widened to the full stop, through the real graph ---
+# --- validate_edit: excluded_categories hard-constraint check (scoped to targets) ---
 
 
-def test_edit_graph_widens_partial_target_to_full_stop(monkeypatch):
+def test_validate_edit_detects_excluded_category_violation_in_targeted_stop():
     macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
     daily_itinerary = make_daily_itinerary(macro_plan)
+    daily_itinerary.days[3].activities.append(_activity("Ramen shop", category="food"))
 
-    # Classifier identifies only day 4 ("more food on day 4"), even though
-    # Kyoto (the owning stop) spans days 4-5.
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        target_stops=["Kyoto"],
+        excluded_categories=["food"],
+        edit_scope="stop",
+        candidate_macro_plan=macro_plan,
+        candidate_daily_itinerary=daily_itinerary,
+    )
+
+    result = validate_edit(state)
+
+    assert result["validation_feedback"] is not None
+    assert "food" in result["validation_feedback"]
+    assert result["edit_retry_count"] == 1
+    assert result["hard_constraint_violation"] is not None
+    assert "Ramen shop" in result["hard_constraint_violation"]
+
+
+def test_validate_edit_ignores_excluded_category_violation_outside_targeted_stops():
+    macro_plan = make_macro_plan()  # Tokyo 1-3, Kyoto 4-5, Osaka 6-7
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    # Pre-existing food activity in Osaka, which this edit does NOT target.
+    daily_itinerary.days[5].activities.append(_activity("Takoyaki stand", category="food"))
+
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        target_stops=["Tokyo", "Kyoto"],  # Osaka not targeted
+        excluded_categories=["food"],
+        edit_scope="stop",
+        candidate_macro_plan=macro_plan,
+        candidate_daily_itinerary=daily_itinerary,
+    )
+
+    result = validate_edit(state)
+
+    assert result["validation_feedback"] is None
+    assert result["hard_constraint_violation"] is None
+
+
+def test_validate_edit_passes_when_excluded_category_absent():
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)  # default category "sightseeing"
+
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        target_stops=["Kyoto"],
+        excluded_categories=["food"],
+        edit_scope="stop",
+        candidate_macro_plan=macro_plan,
+        candidate_daily_itinerary=daily_itinerary,
+    )
+
+    result = validate_edit(state)
+
+    assert result["validation_feedback"] is None
+    assert result["hard_constraint_violation"] is None
+
+
+def test_validate_edit_structural_failure_alone_leaves_hard_constraint_violation_none():
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+    bad_macro_plan = MacroPlan(
+        stops=[
+            MacroStop(city="Tokyo", country="Japan", days=3, rationale="r"),
+            MacroStop(city="Kyoto", country="Japan", days=2, rationale="r"),
+            MacroStop(city="Osaka", country="Japan", days=3, rationale="r"),
+        ]
+    )  # sums to 8, not 7 -> structural failure, no excluded_categories set
+
+    state = make_edit_state(
+        macro_plan=macro_plan,
+        edit_scope="macro",
+        candidate_macro_plan=bad_macro_plan,
+        candidate_daily_itinerary=daily_itinerary,
+    )
+
+    result = validate_edit(state)
+
+    assert result["validation_feedback"] is not None
+    assert "sum to 8" in result["validation_feedback"]
+    assert result["hard_constraint_violation"] is None
+
+
+# --- edit_graph: excluded_categories retry + hard-constraint commit-gating ------
+
+
+def test_edit_graph_retries_stop_edit_on_excluded_category_violation(monkeypatch):
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+
     classification = EditClassification(
-        scope="stop", target_day_numbers=[4], note="Add more food on day 4."
+        scope="stop",
+        target_stops=["Kyoto"],
+        excluded_categories=["food"],
+        note="Exclude food in Kyoto.",
     )
 
     class FakeClassifyChain:
@@ -695,37 +1047,83 @@ def test_edit_graph_widens_partial_target_to_full_stop(monkeypatch):
 
     monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
 
-    new_stop_itinerary = StopItinerary(
+    violating_itinerary = StopItinerary(
         days=[
-            StopDayContent(activities=[_activity("Food day 4", cost=10.0)]),
-            StopDayContent(activities=[_activity("Food day 5", cost=10.0)]),
+            StopDayContent(activities=[_activity("Ramen shop", category="food")]),
+            StopDayContent(activities=[_activity("Temple visit")]),
         ]
     )
-    monkeypatch.setattr(itinerary, "_plan_stop", lambda tr, stop, extra_instruction=None: new_stop_itinerary)
+    clean_itinerary = StopItinerary(
+        days=[
+            StopDayContent(activities=[_activity("Temple visit")]),
+            StopDayContent(activities=[_activity("Garden walk", category="nature")]),
+        ]
+    )
+
+    plan_stop_instructions = []
+
+    def fake_plan_stop(trip_request, stop, extra_instruction=None):
+        plan_stop_instructions.append(extra_instruction)
+        return violating_itinerary if len(plan_stop_instructions) == 1 else clean_itinerary
+
+    monkeypatch.setattr(itinerary, "_plan_stop", fake_plan_stop)
 
     result = itinerary.edit_graph.invoke(
         make_edit_state(
-            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="more food on day 4"
+            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="no food in Kyoto"
         )
     )
 
-    assert result["edit_scope"] == "stop"
+    assert len(plan_stop_instructions) == 2  # initial attempt + one retry
     assert result["validation_feedback"] is None
+    assert result["hard_constraint_violation"] is None
 
-    new_days = result["candidate_daily_itinerary"].days
-    baseline_days = daily_itinerary.days
+    # The retry's instruction actually carried the violation feedback, not
+    # just a repeat of the first attempt's instruction.
+    assert "Fix these issues" not in plan_stop_instructions[0]
+    assert "Fix these issues" in plan_stop_instructions[1]
+    assert "Ramen shop" in plan_stop_instructions[1]
 
-    # Both Kyoto days (4 and 5) were replaced, not just the classifier's
-    # single targeted day 4 - proving the widening happens through the real
-    # compiled graph, not just when apply_stop_edit is called directly.
-    assert new_days[3].day_number == 4
-    assert new_days[3].activities[0].name == "Food day 4"
-    assert new_days[4].day_number == 5
-    assert new_days[4].activities[0].name == "Food day 5"
 
-    # Days outside the targeted stop remain the exact same baseline objects.
-    assert new_days[0] is baseline_days[0]
-    assert new_days[1] is baseline_days[1]
-    assert new_days[2] is baseline_days[2]
-    assert new_days[5] is baseline_days[5]
-    assert new_days[6] is baseline_days[6]
+def test_edit_graph_hard_constraint_violation_not_committed_after_retry_cap(monkeypatch):
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+
+    classification = EditClassification(
+        scope="stop",
+        target_stops=["Kyoto"],
+        excluded_categories=["food"],
+        note="Exclude food in Kyoto.",
+    )
+
+    class FakeClassifyChain:
+        def invoke(self, args):
+            return classification
+
+    monkeypatch.setattr(itinerary, "edit_classify_chain", FakeClassifyChain())
+
+    always_violating = StopItinerary(
+        days=[
+            StopDayContent(activities=[_activity("Ramen shop", category="food")]),
+            StopDayContent(activities=[_activity("Sushi bar", category="food")]),
+        ]
+    )
+    monkeypatch.setattr(itinerary, "_plan_stop", lambda tr, stop, extra_instruction=None: always_violating)
+
+    result = itinerary.edit_graph.invoke(
+        make_edit_state(
+            macro_plan=macro_plan, daily_itinerary=daily_itinerary, edit_request="no food in Kyoto"
+        )
+    )
+
+    # Retries exhausted, violation never fixed.
+    assert result["edit_retry_count"] == itinerary.MAX_EDIT_RETRIES
+    assert result["hard_constraint_violation"] is not None
+
+    new_macro, new_daily, message = _apply_committed_edit(macro_plan, daily_itinerary, result)
+
+    # The still-violating candidate must NOT be committed - baseline preserved.
+    assert new_macro is macro_plan
+    assert new_daily is daily_itinerary
+    assert message is not None
+    assert "couldn't fully satisfy" in message

@@ -47,10 +47,21 @@ class MacroPlan(BaseModel):
     )
 
 
+ActivityCategory = Literal[
+    "sightseeing", "food", "museums", "nature", "culture", "shopping", "nightlife", "other"
+]
+ExcludableCategory = Literal[
+    "sightseeing", "food", "museums", "nature", "culture", "shopping", "nightlife"
+]
+
+
 class Activity(BaseModel):
     name: str
     description: str
-    category: str = Field(description="e.g. sightseeing, food, nature, culture")
+    category: ActivityCategory = Field(
+        description="One of: sightseeing, food, museums, nature, culture, shopping, "
+        "nightlife, other."
+    )
     estimated_cost_usd: Optional[float] = Field(
         default=None, description="Rough per-activity cost estimate in USD."
     )
@@ -361,12 +372,16 @@ def _total_cost(days: List[DayPlan]) -> Optional[float]:
     return sum(costs) if costs else None
 
 
-def _build_daily_itinerary(trip_request: TripRequest, macro_plan: MacroPlan) -> DailyItinerary:
+def _build_daily_itinerary(
+    trip_request: TripRequest,
+    macro_plan: MacroPlan,
+    extra_instruction: Optional[str] = None,
+) -> DailyItinerary:
     days: List[DayPlan] = []
     day_number = 1
 
     for stop in macro_plan.stops:
-        stop_itinerary = _plan_stop(trip_request, stop)
+        stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=extra_instruction)
         for day_content in stop_itinerary.days:
             days.append(
                 DayPlan(
@@ -426,11 +441,13 @@ class EditState(TypedDict):
     edit_request: str
 
     edit_scope: Optional[Literal["macro", "stop", "unsupported"]]
-    target_day_numbers: Optional[List[int]]
+    target_stops: Optional[List[str]]
     classification_note: Optional[str]
+    excluded_categories: Optional[List[str]]
 
     edit_retry_count: int
     validation_feedback: Optional[str]
+    hard_constraint_violation: Optional[str]
 
     candidate_macro_plan: Optional[MacroPlan]
     candidate_daily_itinerary: Optional[DailyItinerary]
@@ -440,11 +457,20 @@ class EditState(TypedDict):
 
 class EditClassification(BaseModel):
     scope: Literal["macro", "stop", "unsupported"]
-    target_day_numbers: List[int] = Field(
+    target_stops: List[str] = Field(
         default_factory=list,
-        description="Day numbers (from the CURRENT daily itinerary) this edit "
-        "targets. Required and non-empty when scope='stop'. Empty when "
-        "scope='macro' or 'unsupported'.",
+        description="City names (copied verbatim from the current macro plan) "
+        "this edit targets. Required and non-empty when scope='stop' - one "
+        "city for a single-stop edit, several for a named subset, or every "
+        "city for a whole-trip content edit. Empty when scope='macro' or "
+        "'unsupported'.",
+    )
+    excluded_categories: List[ExcludableCategory] = Field(
+        default_factory=list,
+        description="Set only when the traveler states a hard exclusion (e.g. "
+        "a dietary restriction, 'no museums', 'no shopping'). One or more of: "
+        "sightseeing, food, museums, nature, culture, shopping, nightlife. "
+        "Empty if no hard exclusion was stated.",
     )
     note: str = Field(
         description="One sentence. If scope='unsupported', explain why this "
@@ -464,17 +490,29 @@ EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
             "Current macro plan (stops in order): {macro_summary}\n"
             "Current daily itinerary (day_number: city): {daily_summary}\n\n"
             "Decide the scope:\n"
-            "- 'macro': the request changes the allocation of days across "
-            "stops, adds/removes/reorders stops, or otherwise affects more "
-            "than one stop (e.g. 'give Tokyo one more day and take it from "
-            "Osaka', 'make the whole trip cheaper').\n"
-            "- 'stop': the request only changes activities within one stop's "
-            "existing days (e.g. 'less museums in Kyoto', 'more food on day "
-            "3'). Set target_day_numbers to the exact day_number(s) that stop "
-            "occupies.\n"
+            "- 'macro': the request changes the trip's STRUCTURE - the "
+            "allocation of days across stops, or adding/removing/reordering "
+            "stops (e.g. 'give Tokyo one more day and take it from Osaka'). "
+            "This is about structural change, not how many stops are "
+            "affected - a content-only request can touch one stop, several, "
+            "or all of them and still belong in 'stop', not 'macro'.\n"
+            "- 'stop': the request only changes activities/content within one "
+            "or more existing stops, without changing the day allocation "
+            "(e.g. 'less museums in Kyoto' -> target_stops=['Kyoto']; "
+            "'exclude food in Innsbruck and Cortina, leave Venice alone' -> "
+            "target_stops=['Innsbruck', 'Cortina d'Ampezzo']; 'kosher only, "
+            "no food anywhere, focus on sightseeing' -> target_stops = every "
+            "city in the plan). Set target_stops to the exact city name(s) "
+            "(copied verbatim from the macro plan above) this edit touches - "
+            "never express this as day numbers.\n"
             "- 'unsupported': the request isn't a plan-edit at all (a factual "
             "question, something unrelated to this trip, or a change this "
-            "planner can't make).",
+            "planner can't make).\n\n"
+            "Separately, if the traveler states a hard exclusion (a dietary "
+            "restriction, 'no museums', 'no shopping', etc.), set "
+            "excluded_categories to the matching categories from: "
+            "sightseeing, food, museums, nature, culture, shopping, "
+            "nightlife. Leave it empty otherwise.",
         ),
         ("human", "{edit_request}"),
     ]
@@ -483,26 +521,16 @@ EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
 edit_classify_chain = EDIT_CLASSIFY_PROMPT | edit_classifier
 
 
-def _validate_stop_target(
-    macro_plan: MacroPlan, daily_itinerary: DailyItinerary, target_day_numbers: List[int]
-) -> Optional[str]:
-    """Returns an error string if target_day_numbers is unusable for a
-    whole-stop edit, or None if it resolves cleanly to a single stop."""
-    if not target_day_numbers:
-        return "no target day(s) were identified for this stop-level edit."
+def _validate_stop_targets(macro_plan: MacroPlan, target_stops: List[str]) -> Optional[str]:
+    """Returns an error string if target_stops is unusable for a stop-level
+    edit, or None if every name resolves to an existing stop."""
+    if not target_stops:
+        return "no target stop(s) were identified for this edit."
 
-    valid_days = {day.day_number for day in daily_itinerary.days}
-    invalid_days = [d for d in target_day_numbers if d not in valid_days]
-    if invalid_days:
-        return f"day(s) {invalid_days} don't exist in the current itinerary."
-
-    try:
-        _find_stop_for_days(macro_plan, target_day_numbers)
-    except ValueError:
-        return (
-            f"day(s) {target_day_numbers} span more than one stop; this kind "
-            "of cross-stop change needs a macro-level edit instead."
-        )
+    known_cities = {stop.city.lower() for stop in macro_plan.stops}
+    unknown = [name for name in target_stops if name.lower() not in known_cities]
+    if unknown:
+        return f"stop(s) {unknown} don't match any stop in the current plan."
     return None
 
 
@@ -524,33 +552,30 @@ def classify_edit(state: EditState) -> dict:
     )
 
     scope = classification.scope
-    target_day_numbers = classification.target_day_numbers or None
+    target_stops = classification.target_stops or None
+    excluded_categories = classification.excluded_categories or None
     note = classification.note
 
     if scope == "stop":
-        error = _validate_stop_target(macro_plan, daily_itinerary, target_day_numbers or [])
+        error = _validate_stop_targets(macro_plan, target_stops or [])
         if error:
             scope = "unsupported"
-            note = f"Could not resolve the target day(s) for this edit: {error}"
+            note = f"Could not resolve the target stop(s) for this edit: {error}"
 
     return {
         "edit_scope": scope,
-        "target_day_numbers": target_day_numbers,
+        "target_stops": target_stops,
         "classification_note": note,
+        "excluded_categories": excluded_categories,
     }
 
 
-def _find_stop_for_days(macro_plan: MacroPlan, target_day_numbers: List[int]) -> MacroStop:
-    day_number = 1
-    for stop in macro_plan.stops:
-        stop_days = set(range(day_number, day_number + stop.days))
-        if set(target_day_numbers) <= stop_days:
-            return stop
-        day_number += stop.days
-    raise ValueError(
-        f"target_day_numbers {target_day_numbers} do not fall entirely within "
-        "a single stop; this should have been classified as scope='macro'."
-    )
+def _resolve_stops(macro_plan: MacroPlan, target_stops: List[str]) -> List[MacroStop]:
+    """The stops named in target_stops, in trip order. Assumes target_stops
+    has already been validated (_validate_stop_targets) to only contain
+    known city names."""
+    wanted = {name.lower() for name in target_stops}
+    return [stop for stop in macro_plan.stops if stop.city.lower() in wanted]
 
 
 def _splice_stop_days(
@@ -584,7 +609,9 @@ def apply_macro_edit(state: EditState) -> dict:
             "current_plan": current_plan,
         }
     )
-    candidate_daily_itinerary = _build_daily_itinerary(trip_request, candidate_macro_plan)
+    candidate_daily_itinerary = _build_daily_itinerary(
+        trip_request, candidate_macro_plan, extra_instruction=instruction
+    )
     return {
         "candidate_macro_plan": candidate_macro_plan,
         "candidate_daily_itinerary": candidate_daily_itinerary,
@@ -605,31 +632,42 @@ def apply_stop_edit(state: EditState) -> dict:
     trip_request = state["trip_request"]
     macro_plan = state["macro_plan"]
     baseline_days = state["daily_itinerary"].days
-    target_day_numbers = state["target_day_numbers"]
+    target_stops = state["target_stops"]
+    excluded_categories = state.get("excluded_categories")
     feedback = state.get("validation_feedback")
 
-    # classify_edit has already validated target_day_numbers resolves to a
-    # single stop; this call is expected to succeed.
-    stop = _find_stop_for_days(macro_plan, target_day_numbers)
-    all_stop_day_numbers = _stop_day_numbers(macro_plan, stop)
+    # classify_edit has already validated target_stops only contains known
+    # city names; this resolution is expected to succeed.
+    stops = _resolve_stops(macro_plan, target_stops)
 
-    previous_activities = [
-        activity.name
-        for day in baseline_days
-        if day.day_number in all_stop_day_numbers
-        for activity in day.activities
-    ]
-    instruction = (
-        f"Traveler edit request: '{state['edit_request']}'. "
-        f"Previously planned activities for this stop: "
-        f"{', '.join(previous_activities) or 'none'}."
+    exclusion_note = (
+        f" Hard constraint: do NOT include any activities in these "
+        f"categories: {', '.join(excluded_categories)}."
+        if excluded_categories
+        else ""
     )
-    if feedback:
-        instruction += f" {feedback}"
 
-    stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=instruction)
+    new_days = baseline_days
+    for stop in stops:
+        stop_day_numbers = _stop_day_numbers(macro_plan, stop)
+        previous_activities = [
+            activity.name
+            for day in baseline_days
+            if day.day_number in stop_day_numbers
+            for activity in day.activities
+        ]
+        instruction = (
+            f"Traveler edit request: '{state['edit_request']}'. "
+            f"Previously planned activities for this stop: "
+            f"{', '.join(previous_activities) or 'none'}."
+            f"{exclusion_note}"
+        )
+        if feedback:
+            instruction += f" {feedback}"
 
-    new_days = _splice_stop_days(baseline_days, all_stop_day_numbers, stop, stop_itinerary.days)
+        stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=instruction)
+        new_days = _splice_stop_days(new_days, stop_day_numbers, stop, stop_itinerary.days)
+
     candidate_daily_itinerary = DailyItinerary(
         days=new_days, estimated_total_cost_usd=_total_cost(new_days)
     )
@@ -669,12 +707,39 @@ def validate_edit(state: EditState) -> dict:
                 f"plan expects '{expected_city}'"
             )
 
+    hard_violations = []
+    excluded_categories = state.get("excluded_categories")
+    if excluded_categories:
+        if state["edit_scope"] == "stop":
+            touched_stops = _resolve_stops(macro_plan, state["target_stops"])
+            touched_days = {
+                day_number
+                for stop in touched_stops
+                for day_number in _stop_day_numbers(macro_plan, stop)
+            }
+        else:
+            touched_days = {day.day_number for day in daily_itinerary.days}
+
+        excluded_set = set(excluded_categories)
+        for day in daily_itinerary.days:
+            if day.day_number not in touched_days:
+                continue
+            for activity in day.activities:
+                if activity.category in excluded_set:
+                    hard_violations.append(
+                        f"day {day.day_number} contains a '{activity.category}' "
+                        f"activity ({activity.name}) despite the exclusion request"
+                    )
+
+    problems.extend(hard_violations)
+
     if not problems:
-        return {"validation_feedback": None}
+        return {"validation_feedback": None, "hard_constraint_violation": None}
 
     return {
         "validation_feedback": "Fix these issues: " + "; ".join(problems),
         "edit_retry_count": state["edit_retry_count"] + 1,
+        "hard_constraint_violation": "; ".join(hard_violations) if hard_violations else None,
     }
 
 
@@ -734,6 +799,16 @@ def _apply_committed_edit(
 ):
     if result["edit_scope"] == "unsupported":
         return macro_plan, daily_itinerary, result["response_message"]
+
+    hard_constraint_violation = result.get("hard_constraint_violation")
+    if hard_constraint_violation:
+        return (
+            macro_plan,
+            daily_itinerary,
+            f"I couldn't fully satisfy that request: {hard_constraint_violation}. "
+            "Your itinerary wasn't changed — try rephrasing the request.",
+        )
+
     return result["candidate_macro_plan"], result["candidate_daily_itinerary"], None
 
 
@@ -790,10 +865,12 @@ if __name__ == "__main__":
                 "daily_itinerary": daily_itinerary,
                 "edit_request": message,
                 "edit_scope": None,
-                "target_day_numbers": None,
+                "target_stops": None,
                 "classification_note": None,
+                "excluded_categories": None,
                 "edit_retry_count": 0,
                 "validation_feedback": None,
+                "hard_constraint_violation": None,
                 "candidate_macro_plan": None,
                 "candidate_daily_itinerary": None,
                 "response_message": None,

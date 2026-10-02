@@ -56,7 +56,7 @@ def build_initial_edit_state(
     daily_itinerary: DailyItinerary,
     message: str,
 ) -> dict:
-    """The exact 12-key EditState shape the CLI __main__ loop already builds
+    """The exact 14-key EditState shape the CLI __main__ loop already builds
     inline, centralized here so it's defined once."""
     return {
         "trip_request": trip_request,
@@ -64,10 +64,12 @@ def build_initial_edit_state(
         "daily_itinerary": daily_itinerary,
         "edit_request": message,
         "edit_scope": None,
-        "target_day_numbers": None,
+        "target_stops": None,
         "classification_note": None,
+        "excluded_categories": None,
         "edit_retry_count": 0,
         "validation_feedback": None,
+        "hard_constraint_violation": None,
         "candidate_macro_plan": None,
         "candidate_daily_itinerary": None,
         "response_message": None,
