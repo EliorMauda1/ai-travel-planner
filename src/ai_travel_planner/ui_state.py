@@ -8,7 +8,7 @@ tests/test_editing.py already does.
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ai_travel_planner import intake, itinerary
 from ai_travel_planner.intake import TripRequest
@@ -54,22 +54,26 @@ def build_initial_edit_state(
     trip_request: TripRequest,
     macro_plan: MacroPlan,
     daily_itinerary: DailyItinerary,
+    active_excluded_categories: List[str],
     message: str,
 ) -> dict:
-    """The exact 14-key EditState shape the CLI __main__ loop already builds
-    inline, centralized here so it's defined once."""
+    """The exact 15-key EditState shape the CLI __main__ loop already builds
+    inline, centralized here so it's defined once. The active exclusions are
+    copied, not aliased, so later session-state mutation can't reach into a
+    live graph run."""
     return {
         "trip_request": trip_request,
         "macro_plan": macro_plan,
         "daily_itinerary": daily_itinerary,
         "edit_request": message,
+        "active_excluded_categories": list(active_excluded_categories),
+        "effective_excluded_categories": [],
         "edit_scope": None,
         "target_stops": None,
         "classification_note": None,
-        "excluded_categories": None,
         "edit_retry_count": 0,
         "validation_feedback": None,
-        "hard_constraint_violation": None,
+        "blocking_violation": None,
         "candidate_macro_plan": None,
         "candidate_daily_itinerary": None,
         "response_message": None,
@@ -100,23 +104,31 @@ def run_edit_turn(
     trip_request: TripRequest,
     macro_plan: MacroPlan,
     daily_itinerary: DailyItinerary,
+    active_excluded_categories: List[str],
     message: str,
-) -> Tuple[MacroPlan, DailyItinerary, Optional[str]]:
+) -> Tuple[MacroPlan, DailyItinerary, List[str], Optional[str]]:
     """Wraps itinerary.edit_graph.invoke() + itinerary._apply_committed_edit().
 
     On success (supported edit, unsupported request, or a best-effort commit
-    after the retry cap): returns the committed (macro_plan, daily_itinerary)
-    and an optional response_message. On an unexpected exception: returns the
-    unchanged baseline plan plus a friendly error message, never raises.
+    after the retry cap): returns the committed plan plus the active trip-wide
+    exclusions after this turn, and an optional response_message. On an
+    unexpected exception: returns the unchanged baseline plan AND the unchanged
+    exclusions plus a friendly error message, never raises - a failed turn must
+    not leak constraint additions or removals into persistent state.
     """
     try:
-        initial_state = build_initial_edit_state(trip_request, macro_plan, daily_itinerary, message)
+        initial_state = build_initial_edit_state(
+            trip_request, macro_plan, daily_itinerary, active_excluded_categories, message
+        )
         result = itinerary.edit_graph.invoke(initial_state)
-        return itinerary._apply_committed_edit(macro_plan, daily_itinerary, result)
+        return itinerary._apply_committed_edit(
+            macro_plan, daily_itinerary, active_excluded_categories, result
+        )
     except Exception:
         logger.exception("run_edit_turn failed")
         return (
             macro_plan,
             daily_itinerary,
+            active_excluded_categories,
             "Something went wrong while updating your plan. Please try again.",
         )

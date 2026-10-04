@@ -34,6 +34,8 @@ def _init_session_state() -> None:
         st.session_state.trip_request = TripRequest()
         st.session_state.macro_plan = None
         st.session_state.daily_itinerary = None
+        # Durable trip-wide exclusions, carried across edit turns.
+        st.session_state.active_excluded_categories = []
         st.session_state.chat_history = [
             ("assistant", "Tell me about the trip you want to plan.")
         ]
@@ -130,14 +132,23 @@ def _handle_message(message: str) -> None:
 
     elif stage == "planned":
         with st.spinner("Applying your edit..."):
-            macro_plan, daily_itinerary, response_message = ui_state.run_edit_turn(
+            (
+                macro_plan,
+                daily_itinerary,
+                active_excluded_categories,
+                response_message,
+            ) = ui_state.run_edit_turn(
                 st.session_state.trip_request,
                 st.session_state.macro_plan,
                 st.session_state.daily_itinerary,
+                st.session_state.active_excluded_categories,
                 message,
             )
+        # run_edit_turn returns the previous exclusions unchanged on any
+        # non-committing outcome, so this assignment is safe unconditionally.
         st.session_state.macro_plan = macro_plan
         st.session_state.daily_itinerary = daily_itinerary
+        st.session_state.active_excluded_categories = active_excluded_categories
         _append("assistant", response_message or "Updated your itinerary.")
 
 

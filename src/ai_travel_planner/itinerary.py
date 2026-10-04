@@ -22,6 +22,7 @@ load_dotenv()
 MAX_MACRO_RETRIES = 2
 MAX_TOOL_ROUND_TRIPS = 3
 MAX_EDIT_RETRIES = 2
+MAX_STOP_DAY_RETRIES = 1
 
 FOURSQUARE_API_KEY = os.getenv("FOURSQUARE_API_KEY")
 FOURSQUARE_SEARCH_URL = "https://places-api.foursquare.com/places/search"
@@ -359,6 +360,37 @@ def _plan_stop(
     return result["stop_itinerary"]
 
 
+def _plan_stop_exact(
+    trip_request: TripRequest,
+    stop: MacroStop,
+    extra_instruction: Optional[str] = None,
+) -> StopItinerary:
+    """Like _plan_stop, but enforces that the result has exactly stop.days
+    day entries - retrying (capped at MAX_STOP_DAY_RETRIES) with a corrective
+    instruction appended to the ORIGINAL extra_instruction if not, and
+    raising rather than silently padding/truncating if it still doesn't
+    match. A day-count mismatch here would otherwise flow uncaught into the
+    committed itinerary (see the live-reproduced "phantom day" bug)."""
+    stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=extra_instruction)
+    attempt = 0
+    while len(stop_itinerary.days) != stop.days and attempt < MAX_STOP_DAY_RETRIES:
+        attempt += 1
+        correction = (
+            f"Your previous attempt returned {len(stop_itinerary.days)} day(s), "
+            f"but this stop is exactly {stop.days} day(s) long. Return exactly "
+            f"{stop.days} day entries, no more and no fewer."
+        )
+        retry_instruction = f"{extra_instruction}\n\n{correction}" if extra_instruction else correction
+        stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=retry_instruction)
+
+    if len(stop_itinerary.days) != stop.days:
+        raise ValueError(
+            f"_plan_stop for '{stop.city}' returned {len(stop_itinerary.days)} "
+            f"day(s) after {attempt + 1} attempt(s); expected {stop.days}."
+        )
+    return stop_itinerary
+
+
 # --- Daily itinerary generation (drives the per-stop sub-flow) ------------
 
 
@@ -381,7 +413,7 @@ def _build_daily_itinerary(
     day_number = 1
 
     for stop in macro_plan.stops:
-        stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=extra_instruction)
+        stop_itinerary = _plan_stop_exact(trip_request, stop, extra_instruction=extra_instruction)
         for day_content in stop_itinerary.days:
             days.append(
                 DayPlan(
@@ -440,14 +472,20 @@ class EditState(TypedDict):
     daily_itinerary: DailyItinerary
     edit_request: str
 
+    # Durable, trip-wide exclusions. active_* is the persisted baseline at the
+    # start of this turn and is never mutated by the graph; effective_* is the
+    # result after applying this turn's add/remove delta, and is what every
+    # downstream node (generation + validation) actually honors.
+    active_excluded_categories: List[str]
+    effective_excluded_categories: List[str]
+
     edit_scope: Optional[Literal["macro", "stop", "unsupported"]]
     target_stops: Optional[List[str]]
     classification_note: Optional[str]
-    excluded_categories: Optional[List[str]]
 
     edit_retry_count: int
     validation_feedback: Optional[str]
-    hard_constraint_violation: Optional[str]
+    blocking_violation: Optional[str]
 
     candidate_macro_plan: Optional[MacroPlan]
     candidate_daily_itinerary: Optional[DailyItinerary]
@@ -465,12 +503,20 @@ class EditClassification(BaseModel):
         "city for a whole-trip content edit. Empty when scope='macro' or "
         "'unsupported'.",
     )
-    excluded_categories: List[ExcludableCategory] = Field(
+    add_excluded_categories: List[ExcludableCategory] = Field(
         default_factory=list,
-        description="Set only when the traveler states a hard exclusion (e.g. "
-        "a dietary restriction, 'no museums', 'no shopping'). One or more of: "
-        "sightseeing, food, museums, nature, culture, shopping, nightlife. "
-        "Empty if no hard exclusion was stated.",
+        description="Categories the traveler is newly banning TRIP-WIDE and "
+        "durably (e.g. 'I only eat kosher food so no restaurants anywhere', "
+        "'we never do nightlife'). Leave EMPTY for a stop-local request like "
+        "'no food in Venice' or 'fewer museums in Kyoto' - those are ordinary "
+        "content edits, not durable constraints.",
+    )
+    remove_excluded_categories: List[ExcludableCategory] = Field(
+        default_factory=list,
+        description="Categories the traveler is explicitly lifting from the "
+        "currently-active trip-wide exclusions (e.g. 'actually restaurants are "
+        "fine now' -> ['food']). Leave EMPTY unless a previously-stated "
+        "constraint is being revoked.",
     )
     note: str = Field(
         description="One sentence. If scope='unsupported', explain why this "
@@ -488,7 +534,8 @@ EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
             "You classify a traveler's edit request against their existing "
             "trip plan.\n"
             "Current macro plan (stops in order): {macro_summary}\n"
-            "Current daily itinerary (day_number: city): {daily_summary}\n\n"
+            "Current daily itinerary (day_number: city): {daily_summary}\n"
+            "Currently active trip-wide exclusions: {active_exclusions}\n\n"
             "Decide the scope:\n"
             "- 'macro': the request changes the trip's STRUCTURE - the "
             "allocation of days across stops, or adding/removing/reordering "
@@ -508,11 +555,19 @@ EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
             "- 'unsupported': the request isn't a plan-edit at all (a factual "
             "question, something unrelated to this trip, or a change this "
             "planner can't make).\n\n"
-            "Separately, if the traveler states a hard exclusion (a dietary "
-            "restriction, 'no museums', 'no shopping', etc.), set "
-            "excluded_categories to the matching categories from: "
-            "sightseeing, food, museums, nature, culture, shopping, "
-            "nightlife. Leave it empty otherwise.",
+            "Separately, track DURABLE TRIP-WIDE constraints:\n"
+            "- add_excluded_categories: the traveler is newly banning a "
+            "category across the WHOLE trip (e.g. 'I only eat kosher food so "
+            "no restaurants anywhere', 'we never do nightlife').\n"
+            "- remove_excluded_categories: the traveler is lifting one of the "
+            "currently active exclusions listed above (e.g. 'actually "
+            "restaurants are fine now' -> ['food']).\n"
+            "Both are drawn from: sightseeing, food, museums, nature, "
+            "culture, shopping, nightlife.\n"
+            "IMPORTANT: a stop-local request ('no food in Venice', 'fewer "
+            "museums in Kyoto') is NOT a durable constraint - leave BOTH "
+            "lists empty and classify it as an ordinary 'stop' edit targeting "
+            "only the named stop(s).",
         ),
         ("human", "{edit_request}"),
     ]
@@ -537,6 +592,7 @@ def _validate_stop_targets(macro_plan: MacroPlan, target_stops: List[str]) -> Op
 def classify_edit(state: EditState) -> dict:
     macro_plan = state["macro_plan"]
     daily_itinerary = state["daily_itinerary"]
+    active = set(state["active_excluded_categories"])
 
     macro_summary = "; ".join(f"{stop.city} ({stop.days}d)" for stop in macro_plan.stops)
     daily_summary = "; ".join(
@@ -547,14 +603,40 @@ def classify_edit(state: EditState) -> dict:
         {
             "macro_summary": macro_summary,
             "daily_summary": daily_summary,
+            "active_exclusions": ", ".join(sorted(active)) or "none",
             "edit_request": state["edit_request"],
         }
     )
 
     scope = classification.scope
     target_stops = classification.target_stops or None
-    excluded_categories = classification.excluded_categories or None
     note = classification.note
+
+    # Durable trip-wide exclusion delta. A category appearing in BOTH lists is
+    # contradictory classifier output and is treated as a no-op for that
+    # category, leaving its previous active state untouched.
+    add = set(classification.add_excluded_categories)
+    remove = set(classification.remove_excluded_categories)
+    conflicting = add & remove
+    effective_set = (active | (add - conflicting)) - (remove - conflicting)
+    effective = sorted(effective_set)
+
+    # If the durable set actually changed, the whole trip must be regenerated
+    # under the new constraints - otherwise we would persist a trip-wide
+    # exclusion while leaving prohibited content in stops we never touched.
+    # (When effective_set == active there is nothing new to purge: the turn
+    # that introduced the constraint already regenerated every stop.)
+    if effective_set != active and scope != "macro":
+        # Covers a partially-targeted 'stop' edit AND an 'unsupported'
+        # classification that nonetheless carried a real constraint change.
+        scope = "stop"
+        target_stops = [stop.city for stop in macro_plan.stops]
+        note = (
+            "Applying trip-wide exclusions "
+            f"({', '.join(effective) or 'none'}) across every stop."
+        )
+    # scope == "macro" needs no expansion: macro regeneration already rebuilds
+    # every stop's day content.
 
     if scope == "stop":
         error = _validate_stop_targets(macro_plan, target_stops or [])
@@ -566,7 +648,7 @@ def classify_edit(state: EditState) -> dict:
         "edit_scope": scope,
         "target_stops": target_stops,
         "classification_note": note,
-        "excluded_categories": excluded_categories,
+        "effective_excluded_categories": effective,
     }
 
 
@@ -578,12 +660,32 @@ def _resolve_stops(macro_plan: MacroPlan, target_stops: List[str]) -> List[Macro
     return [stop for stop in macro_plan.stops if stop.city.lower() in wanted]
 
 
+def _exclusion_note(effective_excluded_categories: List[str]) -> str:
+    """The generation-instruction fragment that proactively tells the planner
+    which categories are banned. Shared by both apply nodes so they emit
+    identical wording; validate_edit stays a backstop, not the teacher."""
+    if not effective_excluded_categories:
+        return ""
+    return (
+        f" Hard constraint: do NOT include any activities in these "
+        f"categories: {', '.join(effective_excluded_categories)}."
+    )
+
+
 def _splice_stop_days(
     baseline_days: List[DayPlan],
     target_day_numbers: List[int],
     stop: MacroStop,
     new_days: List[StopDayContent],
 ) -> List[DayPlan]:
+    if len(new_days) != len(target_day_numbers):
+        # zip() would otherwise silently truncate to the shorter list,
+        # leaving some target days holding stale baseline content.
+        raise ValueError(
+            f"_splice_stop_days got {len(new_days)} new day(s) for "
+            f"{len(target_day_numbers)} target day number(s) in '{stop.city}'; "
+            "these must match exactly."
+        )
     replacement = {
         day_number: DayPlan(day_number=day_number, city=stop.city, activities=content.activities)
         for day_number, content in zip(sorted(target_day_numbers), new_days)
@@ -598,19 +700,24 @@ def apply_macro_edit(state: EditState) -> dict:
 
     current_plan = "; ".join(f"{stop.city} ({stop.days}d)" for stop in macro_plan.stops)
 
-    instruction = f"Traveler wants this change: {state['edit_request']}."
+    macro_instruction = f"Traveler wants this change: {state['edit_request']}."
     if feedback:
-        instruction += f" {feedback}"
+        macro_instruction += f" {feedback}"
 
+    # Macro allocation is about cities and day counts; activity-category
+    # exclusions belong only in the day-content regeneration below.
     candidate_macro_plan = macro_chain.invoke(
         {
             "trip_request": trip_request.model_dump_json(),
-            "feedback": instruction,
+            "feedback": macro_instruction,
             "current_plan": current_plan,
         }
     )
+    content_instruction = macro_instruction + _exclusion_note(
+        state["effective_excluded_categories"]
+    )
     candidate_daily_itinerary = _build_daily_itinerary(
-        trip_request, candidate_macro_plan, extra_instruction=instruction
+        trip_request, candidate_macro_plan, extra_instruction=content_instruction
     )
     return {
         "candidate_macro_plan": candidate_macro_plan,
@@ -633,19 +740,13 @@ def apply_stop_edit(state: EditState) -> dict:
     macro_plan = state["macro_plan"]
     baseline_days = state["daily_itinerary"].days
     target_stops = state["target_stops"]
-    excluded_categories = state.get("excluded_categories")
     feedback = state.get("validation_feedback")
 
     # classify_edit has already validated target_stops only contains known
     # city names; this resolution is expected to succeed.
     stops = _resolve_stops(macro_plan, target_stops)
 
-    exclusion_note = (
-        f" Hard constraint: do NOT include any activities in these "
-        f"categories: {', '.join(excluded_categories)}."
-        if excluded_categories
-        else ""
-    )
+    exclusion_note = _exclusion_note(state["effective_excluded_categories"])
 
     new_days = baseline_days
     for stop in stops:
@@ -665,7 +766,7 @@ def apply_stop_edit(state: EditState) -> dict:
         if feedback:
             instruction += f" {feedback}"
 
-        stop_itinerary = _plan_stop(trip_request, stop, extra_instruction=instruction)
+        stop_itinerary = _plan_stop_exact(trip_request, stop, extra_instruction=instruction)
         new_days = _splice_stop_days(new_days, stop_day_numbers, stop, stop_itinerary.days)
 
     candidate_daily_itinerary = DailyItinerary(
@@ -683,10 +784,26 @@ def validate_edit(state: EditState) -> dict:
     trip_request = state["trip_request"]
 
     problems = []
+    blocking_problems = []
 
     total_days = sum(stop.days for stop in macro_plan.stops)
     if total_days != trip_request.duration_days:
         problems.append(f"stop days sum to {total_days}, expected {trip_request.duration_days}")
+
+    if len(daily_itinerary.days) != total_days:
+        # A raw count mismatch against the (candidate) macro plan - not just
+        # self-referential contiguity - catches overflow/underflow even when
+        # it lands entirely past the macro plan's last declared day (where
+        # city_by_day below has nothing to compare against and would
+        # otherwise miss it silently). Self-contradictory, not best-effort
+        # safe: subsequent edits derive day ranges from macro_plan, so a
+        # surviving mismatch would corrupt every future edit's targeting.
+        day_count_problem = (
+            f"daily itinerary has {len(daily_itinerary.days)} day(s) but the "
+            f"macro plan's stops sum to {total_days} day(s)"
+        )
+        problems.append(day_count_problem)
+        blocking_problems.append(day_count_problem)
 
     day_numbers = [day.day_number for day in daily_itinerary.days]
     expected_numbers = list(range(1, len(day_numbers) + 1))
@@ -707,8 +824,9 @@ def validate_edit(state: EditState) -> dict:
                 f"plan expects '{expected_city}'"
             )
 
-    hard_violations = []
-    excluded_categories = state.get("excluded_categories")
+    # The EFFECTIVE set, so a persisted exclusion is still enforced on later
+    # turns whose text never mentions it.
+    excluded_categories = state["effective_excluded_categories"]
     if excluded_categories:
         if state["edit_scope"] == "stop":
             touched_stops = _resolve_stops(macro_plan, state["target_stops"])
@@ -726,20 +844,20 @@ def validate_edit(state: EditState) -> dict:
                 continue
             for activity in day.activities:
                 if activity.category in excluded_set:
-                    hard_violations.append(
+                    violation = (
                         f"day {day.day_number} contains a '{activity.category}' "
                         f"activity ({activity.name}) despite the exclusion request"
                     )
-
-    problems.extend(hard_violations)
+                    problems.append(violation)
+                    blocking_problems.append(violation)
 
     if not problems:
-        return {"validation_feedback": None, "hard_constraint_violation": None}
+        return {"validation_feedback": None, "blocking_violation": None}
 
     return {
         "validation_feedback": "Fix these issues: " + "; ".join(problems),
         "edit_retry_count": state["edit_retry_count"] + 1,
-        "hard_constraint_violation": "; ".join(hard_violations) if hard_violations else None,
+        "blocking_violation": "; ".join(blocking_problems) if blocking_problems else None,
     }
 
 
@@ -795,21 +913,39 @@ edit_graph = edit_graph_builder.compile()
 
 
 def _apply_committed_edit(
-    macro_plan: MacroPlan, daily_itinerary: DailyItinerary, result: dict
+    macro_plan: MacroPlan,
+    daily_itinerary: DailyItinerary,
+    active_excluded_categories: List[str],
+    result: dict,
 ):
+    """Single source of truth for whether a turn commits: the candidate plan
+    and the candidate exclusions are adopted together, or neither is. Callers
+    reassign all four returned values unconditionally, so persistence is never
+    inferred from message formatting or any other indirect signal."""
     if result["edit_scope"] == "unsupported":
-        return macro_plan, daily_itinerary, result["response_message"]
-
-    hard_constraint_violation = result.get("hard_constraint_violation")
-    if hard_constraint_violation:
         return (
             macro_plan,
             daily_itinerary,
-            f"I couldn't fully satisfy that request: {hard_constraint_violation}. "
+            active_excluded_categories,
+            result["response_message"],
+        )
+
+    blocking_violation = result.get("blocking_violation")
+    if blocking_violation:
+        return (
+            macro_plan,
+            daily_itinerary,
+            active_excluded_categories,
+            f"I couldn't safely apply that edit: {blocking_violation}. "
             "Your itinerary wasn't changed — try rephrasing the request.",
         )
 
-    return result["candidate_macro_plan"], result["candidate_daily_itinerary"], None
+    return (
+        result["candidate_macro_plan"],
+        result["candidate_daily_itinerary"],
+        result["effective_excluded_categories"],
+        None,
+    )
 
 
 def _print_result(result: dict) -> None:
@@ -852,6 +988,8 @@ if __name__ == "__main__":
     daily_itinerary = result["daily_itinerary"]
     _print_result(result)
 
+    active_excluded_categories: List[str] = []
+
     print("\nYou can now ask for changes (or type 'done' to finish).")
     while True:
         message = input("> ").strip()
@@ -864,20 +1002,26 @@ if __name__ == "__main__":
                 "macro_plan": macro_plan,
                 "daily_itinerary": daily_itinerary,
                 "edit_request": message,
+                "active_excluded_categories": list(active_excluded_categories),
+                "effective_excluded_categories": [],
                 "edit_scope": None,
                 "target_stops": None,
                 "classification_note": None,
-                "excluded_categories": None,
                 "edit_retry_count": 0,
                 "validation_feedback": None,
-                "hard_constraint_violation": None,
+                "blocking_violation": None,
                 "candidate_macro_plan": None,
                 "candidate_daily_itinerary": None,
                 "response_message": None,
             }
         )
-        macro_plan, daily_itinerary, message_out = _apply_committed_edit(
-            macro_plan, daily_itinerary, edit_result
+        (
+            macro_plan,
+            daily_itinerary,
+            active_excluded_categories,
+            message_out,
+        ) = _apply_committed_edit(
+            macro_plan, daily_itinerary, active_excluded_categories, edit_result
         )
         if message_out:
             print(message_out)

@@ -151,20 +151,23 @@ def test_build_initial_edit_state_shape():
     macro_plan = make_macro_plan()
     daily_itinerary = make_daily_itinerary(macro_plan)
 
-    state = ui_state.build_initial_edit_state(trip_request, macro_plan, daily_itinerary, "less museums")
+    state = ui_state.build_initial_edit_state(
+        trip_request, macro_plan, daily_itinerary, ["food"], "less museums"
+    )
 
     assert set(state.keys()) == {
         "trip_request",
         "macro_plan",
         "daily_itinerary",
         "edit_request",
+        "active_excluded_categories",
+        "effective_excluded_categories",
         "edit_scope",
         "target_stops",
         "classification_note",
-        "excluded_categories",
         "edit_retry_count",
         "validation_feedback",
-        "hard_constraint_violation",
+        "blocking_violation",
         "candidate_macro_plan",
         "candidate_daily_itinerary",
         "response_message",
@@ -173,16 +176,34 @@ def test_build_initial_edit_state_shape():
     assert state["macro_plan"] is macro_plan
     assert state["daily_itinerary"] is daily_itinerary
     assert state["edit_request"] == "less museums"
+    assert state["active_excluded_categories"] == ["food"]
+    assert state["effective_excluded_categories"] == []
     assert state["edit_scope"] is None
     assert state["target_stops"] is None
     assert state["classification_note"] is None
-    assert state["excluded_categories"] is None
     assert state["edit_retry_count"] == 0
     assert state["validation_feedback"] is None
-    assert state["hard_constraint_violation"] is None
+    assert state["blocking_violation"] is None
     assert state["candidate_macro_plan"] is None
     assert state["candidate_daily_itinerary"] is None
     assert state["response_message"] is None
+
+
+def test_build_initial_edit_state_seeds_exclusions_defensively():
+    trip_request = TripRequest(destination="Japan", duration_days=5, traveler_count=1)
+    macro_plan = make_macro_plan()
+    daily_itinerary = make_daily_itinerary(macro_plan)
+
+    active = ["food"]
+    state = ui_state.build_initial_edit_state(
+        trip_request, macro_plan, daily_itinerary, active, "less museums"
+    )
+
+    assert state["active_excluded_categories"] == ["food"]
+    assert state["active_excluded_categories"] is not active  # copied, not aliased
+
+    active.append("nightlife")
+    assert state["active_excluded_categories"] == ["food"]  # unaffected by later mutation
 
 
 # --- generate_initial_plan ---------------------------------------------------
@@ -242,17 +263,19 @@ def test_run_edit_turn_happy_path(monkeypatch):
                 "edit_scope": "stop",
                 "candidate_macro_plan": candidate_macro,
                 "candidate_daily_itinerary": candidate_daily,
+                "effective_excluded_categories": ["food"],
             }
 
     monkeypatch.setattr(itinerary, "edit_graph", FakeEditGraph())
 
-    new_macro, new_daily, message = ui_state.run_edit_turn(
-        trip_request, macro_plan, daily_itinerary, "less museums in Kyoto"
+    new_macro, new_daily, new_excl, message = ui_state.run_edit_turn(
+        trip_request, macro_plan, daily_itinerary, ["food"], "less museums in Kyoto"
     )
 
     # Delegated to the real _apply_committed_edit, which commits the candidate.
     assert new_macro is candidate_macro
     assert new_daily is candidate_daily
+    assert new_excl == ["food"]
     assert message is None
 
 
@@ -270,12 +293,13 @@ def test_run_edit_turn_unsupported_leaves_baseline_unchanged(monkeypatch):
 
     monkeypatch.setattr(itinerary, "edit_graph", FakeEditGraph())
 
-    new_macro, new_daily, message = ui_state.run_edit_turn(
-        trip_request, macro_plan, daily_itinerary, "what's the JR pass?"
+    new_macro, new_daily, new_excl, message = ui_state.run_edit_turn(
+        trip_request, macro_plan, daily_itinerary, ["food"], "what's the JR pass?"
     )
 
     assert new_macro is macro_plan
     assert new_daily is daily_itinerary
+    assert new_excl == ["food"]
     assert message == "I can't apply that as a plan edit."
 
 
@@ -291,13 +315,15 @@ def test_run_edit_turn_handles_exception(monkeypatch, caplog):
     monkeypatch.setattr(itinerary, "edit_graph", FailingEditGraph())
 
     with caplog.at_level(logging.ERROR, logger="ai_travel_planner.ui_state"):
-        new_macro, new_daily, message = ui_state.run_edit_turn(
-            trip_request, macro_plan, daily_itinerary, "less museums"
+        new_macro, new_daily, new_excl, message = ui_state.run_edit_turn(
+            trip_request, macro_plan, daily_itinerary, ["food"], "less museums"
         )
 
-    # Baseline preserved (identity), not corrupted or partially updated.
+    # Baseline preserved (identity), not corrupted or partially updated -
+    # including the active exclusions, which must not be lost on exception.
     assert new_macro is macro_plan
     assert new_daily is daily_itinerary
+    assert new_excl == ["food"]
     assert message is not None
     assert "timeout" not in message
     assert "run_edit_turn failed" in caplog.text
