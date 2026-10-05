@@ -83,11 +83,16 @@ followup_chain = FOLLOWUP_PROMPT | model
 
 
 def missing_essentials(trip: TripRequest) -> list[str]:
-    return [
-        description
-        for field, description in ESSENTIAL_FIELDS.items()
-        if getattr(trip, field) is None
-    ]
+    missing = []
+    for field, description in ESSENTIAL_FIELDS.items():
+        value = getattr(trip, field)
+        # All essential fields are numeric (duration_days, budget_usd,
+        # traveler_count), so a non-positive value is as unusable as a
+        # missing one - treating it as "still missing" reuses the existing
+        # re-ask mechanism rather than adding a new validation path.
+        if value is None or value <= 0:
+            missing.append(description)
+    return missing
 
 
 def run_intake() -> TripRequest:

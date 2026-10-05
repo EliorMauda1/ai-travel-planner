@@ -180,6 +180,43 @@ def route_after_validation(state: ItineraryState) -> str:
 # --- Places search tool (Foursquare) --------------------------------------
 
 
+def _parse_foursquare_response(payload: object) -> Optional[List[dict]]:
+    """Deterministic schema validation for a decoded Foursquare response body.
+
+    Contract: None = the shape is untrustworthy (not a well-formed search
+    response), [] = well-formed response with zero usable places, List[dict]
+    = well-formed places. Only the structural invariants below invalidate the
+    WHOLE response (None); malformed/missing optional metadata on an
+    otherwise-valid entry (category, address) never does - it just leaves
+    that field as None on an entry that's still included."""
+    if not isinstance(payload, dict):
+        return None
+
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return None
+
+    places = []
+    for entry in results:
+        if not isinstance(entry, dict):
+            return None
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        categories = entry.get("categories")
+        category_name = None
+        if isinstance(categories, list) and categories and isinstance(categories[0], dict):
+            category_name = categories[0].get("name")
+
+        location = entry.get("location")
+        address = location.get("formatted_address") if isinstance(location, dict) else None
+
+        places.append({"name": name, "category": category_name, "address": address})
+    return places
+
+
 def _foursquare_search(city: str, category: str, query: str) -> Optional[List[dict]]:
     """Hit the Foursquare Places API. Returns None on failure, [] on no results."""
     if not FOURSQUARE_API_KEY:
@@ -198,25 +235,11 @@ def _foursquare_search(city: str, category: str, query: str) -> Optional[List[di
             timeout=10,
         )
         response.raise_for_status()
+        payload = response.json()
     except requests.RequestException:
         return None
 
-    results = response.json().get("results", [])
-    places = []
-    for r in results:
-        name = r.get("name")
-        if not name:
-            continue
-        categories = r.get("categories") or [{}]
-        location = r.get("location") or {}
-        places.append(
-            {
-                "name": name,
-                "category": categories[0].get("name"),
-                "address": location.get("formatted_address"),
-            }
-        )
-    return places
+    return _parse_foursquare_response(payload)
 
 
 @tool
@@ -404,6 +427,37 @@ def _total_cost(days: List[DayPlan]) -> Optional[float]:
     return sum(costs) if costs else None
 
 
+def _uncosted_activity_count(days: List[DayPlan]) -> int:
+    """How many activities _total_cost silently excluded from its sum because
+    they have no cost estimate - without this, the total looks precise even
+    when it's actually missing line items."""
+    return sum(
+        1
+        for day in days
+        for activity in day.activities
+        if activity.estimated_cost_usd is None
+    )
+
+
+def _budget_warning(trip_request: TripRequest, daily_itinerary: DailyItinerary) -> Optional[str]:
+    """A warning ONLY - never a reassurance. Known activity costs are a
+    partial, LLM-estimated figure (excludes flights/lodging/transport), so
+    costs landing at or under the stated budget says nothing about whether
+    the trip overall is affordable - so that case returns None rather than
+    any "within budget" claim. Also None when either value is unset."""
+    budget_usd = trip_request.budget_usd
+    cost = daily_itinerary.estimated_total_cost_usd
+    if budget_usd is None or cost is None or cost <= budget_usd:
+        return None
+
+    overage = cost - budget_usd
+    return (
+        f"Known activity costs alone are ${overage:.0f} over your stated "
+        f"${budget_usd:.0f} trip budget. Flights, lodging, and transport "
+        "are not included."
+    )
+
+
 def _build_daily_itinerary(
     trip_request: TripRequest,
     macro_plan: MacroPlan,
@@ -554,7 +608,16 @@ EDIT_CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
             "never express this as day numbers.\n"
             "- 'unsupported': the request isn't a plan-edit at all (a factual "
             "question, something unrelated to this trip, or a change this "
-            "planner can't make).\n\n"
+            "planner can't make) OR it's genuinely ambiguous/underspecified "
+            "(e.g. 'make it better'; 'change the second day' with no "
+            "indication of WHAT should change about it; two asks that "
+            "contradict each other, like 'add more museums and remove all "
+            "museums'). For the ambiguous case, DO NOT guess a scope or "
+            "target - use 'unsupported' and set `note` to a short, specific "
+            "clarifying question the traveler could answer (e.g. 'What "
+            "would you like me to change about day 2?' or 'Which part of "
+            "the itinerary would you like improved?'), not a flat "
+            "refusal.\n\n"
             "Separately, track DURABLE TRIP-WIDE constraints:\n"
             "- add_excluded_categories: the traveler is newly banning a "
             "category across the WHOLE trip (e.g. 'I only eat kosher food so "
@@ -948,7 +1011,7 @@ def _apply_committed_edit(
     )
 
 
-def _print_result(result: dict) -> None:
+def _print_result(trip_request: TripRequest, result: dict) -> None:
     macro_plan: MacroPlan = result["macro_plan"]
     daily_itinerary: DailyItinerary = result["daily_itinerary"]
 
@@ -977,7 +1040,13 @@ def _print_result(result: dict) -> None:
             )
 
     if daily_itinerary.estimated_total_cost_usd is not None:
-        print(f"\nEstimated total cost: ${daily_itinerary.estimated_total_cost_usd:.0f}")
+        uncosted = _uncosted_activity_count(daily_itinerary.days)
+        caveat = f" ({uncosted} activity(ies) without a cost estimate)" if uncosted else ""
+        print(f"\nEstimated activity cost: ${daily_itinerary.estimated_total_cost_usd:.0f}{caveat}")
+
+    budget_warning = _budget_warning(trip_request, daily_itinerary)
+    if budget_warning:
+        print(f"\nBudget warning: {budget_warning}")
 
 
 if __name__ == "__main__":
@@ -986,7 +1055,7 @@ if __name__ == "__main__":
     result = plan_trip(trip)
     macro_plan = result["macro_plan"]
     daily_itinerary = result["daily_itinerary"]
-    _print_result(result)
+    _print_result(trip, result)
 
     active_excluded_categories: List[str] = []
 
@@ -1027,4 +1096,4 @@ if __name__ == "__main__":
             print(message_out)
         else:
             print("\nUpdated.")
-            _print_result({"macro_plan": macro_plan, "daily_itinerary": daily_itinerary})
+            _print_result(trip, {"macro_plan": macro_plan, "daily_itinerary": daily_itinerary})

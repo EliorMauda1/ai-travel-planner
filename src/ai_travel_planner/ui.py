@@ -23,7 +23,12 @@ if not os.getenv("OPENAI_API_KEY"):
 
 from ai_travel_planner import ui_state
 from ai_travel_planner.intake import TripRequest
-from ai_travel_planner.itinerary import DailyItinerary, MacroPlan
+from ai_travel_planner.itinerary import (
+    DailyItinerary,
+    MacroPlan,
+    _budget_warning,
+    _uncosted_activity_count,
+)
 
 st.title("AI Travel Planner")
 
@@ -45,7 +50,9 @@ def _append(role: str, content: str) -> None:
     st.session_state.chat_history.append((role, content))
 
 
-def render_itinerary(macro_plan: MacroPlan, daily_itinerary: DailyItinerary) -> None:
+def render_itinerary(
+    trip_request: TripRequest, macro_plan: MacroPlan, daily_itinerary: DailyItinerary
+) -> None:
     st.subheader("Macro plan")
     for stop in macro_plan.stops:
         location = f"{stop.city}, {stop.country}" if stop.country else stop.city
@@ -66,7 +73,18 @@ def render_itinerary(macro_plan: MacroPlan, daily_itinerary: DailyItinerary) -> 
             )
 
     if daily_itinerary.estimated_total_cost_usd is not None:
-        st.markdown(f"**Estimated total cost:** ${daily_itinerary.estimated_total_cost_usd:.0f}")
+        uncosted = _uncosted_activity_count(daily_itinerary.days)
+        caveat = f" ({uncosted} activity(ies) without a cost estimate)" if uncosted else ""
+        st.markdown(
+            f"**Estimated activity cost:** ${daily_itinerary.estimated_total_cost_usd:.0f}{caveat}"
+        )
+
+    budget_warning = _budget_warning(trip_request, daily_itinerary)
+    if budget_warning:
+        # st.warning renders markdown, and a pair of "$" is interpreted as
+        # inline LaTeX math - the warning text has two ($overage, $budget),
+        # so they must be escaped or the dollar amounts silently vanish.
+        st.warning(budget_warning.replace("$", "\\$"))
 
 
 def _handle_message(message: str) -> None:
@@ -169,6 +187,8 @@ with chat_col:
 with itinerary_col:
     st.subheader("Itinerary")
     if st.session_state.macro_plan and st.session_state.daily_itinerary:
-        render_itinerary(st.session_state.macro_plan, st.session_state.daily_itinerary)
+        render_itinerary(
+            st.session_state.trip_request, st.session_state.macro_plan, st.session_state.daily_itinerary
+        )
     else:
         st.info("Your itinerary will appear here once planning is complete.")
